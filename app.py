@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from io import BytesIO
 from typing import Dict, List, Optional, Tuple
 
@@ -25,6 +26,9 @@ def ss_init():
     st.session_state.setdefault("invalid_item_ids", [])
     st.session_state.setdefault("incomplete_item_ids", [])
     st.session_state.setdefault("upload_name", None)
+    st.session_state.setdefault("upload_digest", None)
+    # Jump-to sentence number widget state
+    st.session_state.setdefault("jump_to_sentence", 1)
 
 
 ss_init()
@@ -59,6 +63,16 @@ def _get_row_index(item_idx: int) -> int:
     # openpyxl row index: header row is 1, first data row is 2
     return 2 + item_idx
 
+
+
+
+def _set_jump_to_sentence(n: int) -> None:
+    """
+    Defer updating the jump-to widget value until the *next* rerun.
+    This avoids StreamlitAPIException from mutating a widget-bound key
+    after the widget is instantiated.
+    """
+    st.session_state["jump_to_sentence_pending"] = int(n)
 
 def _recompute_global_status():
     state = st.session_state.wb_state
@@ -121,13 +135,16 @@ def _jump_to_item_id(target_item_id: int):
     state = st.session_state.wb_state
     if target_item_id not in state.item_ids:
         return
-    st.session_state.current_item_idx = state.item_ids.index(target_item_id)
+    new_idx = state.item_ids.index(target_item_id)
+    st.session_state.current_item_idx = new_idx
+    _set_jump_to_sentence(int(new_idx + 1))
+
 
 
 def _jump_first_incomplete():
     inc = st.session_state.incomplete_item_ids
     if inc:
-        _jump_to_item_id(inc[0])
+        _jump_to_item_id(int(inc[0]))
 
 
 def _jump_next_invalid():
@@ -137,7 +154,7 @@ def _jump_next_invalid():
     state = st.session_state.wb_state
     cur_item_id = state.item_ids[st.session_state.current_item_idx]
     after = [x for x in inv if x > cur_item_id]
-    _jump_to_item_id(after[0] if after else inv[0])
+    _jump_to_item_id(int(after[0] if after else inv[0]))
 
 
 def _render_banner():
@@ -325,6 +342,31 @@ def _current_committed_at() -> Optional[str]:
     return eval_ws.cell(row=r, column=ec["committed_at"]).value
 
 
+def get_cur_idx():
+    idx = st.session_state.current_item_idx
+    return max(0, min(idx, N_items - 1))
+
+
+def _rank_for_pos(pos: int) -> Tuple[int, int, int]:
+    """
+    Sort key: (bucket_rank_best_first, -da, pos)
+    Unselected bucket goes to bottom.
+    """
+    bucket_label = st.session_state.get(f"bucket_pos_{cur_item_id}_{pos}", BUCKET_PLACEHOLDER)
+    if bucket_label == BUCKET_PLACEHOLDER:
+        bucket_rank = 999
+    else:
+        b_key = label_to_key.get(str(bucket_label))
+        bucket_rank = bucket_key_to_rank_best_first.get(b_key, 999)
+
+    da_val = st.session_state.get(f"da_val_{cur_item_id}_{pos}", cfg.da_min)
+    try:
+        da_i = int(da_val)
+    except Exception:
+        da_i = int(cfg.da_min)
+
+    return (bucket_rank, -da_i, pos)
+
 # ---------------- UI: Upload / Init ----------------
 st.title("Machine Translation Human Evaluation")
 
@@ -354,16 +396,29 @@ if uploaded is None and st.session_state.wb_state is None:
     st.info("Upload the researcher-provided XLSX to begin or resume.")
     st.stop()
 
+# IMPORTANT: file_uploader retains its value across reruns. Only (re)load the workbook when
+# the user actually uploads a *new* file, otherwise navigation will be reset every rerun.
 if uploaded is not None:
     try:
         file_bytes = uploaded.read()
-        st.session_state.upload_name = uploaded.name
-        st.session_state.wb_state = load_workbook_from_upload(file_bytes, cfg)
-        # On load: jump to first incomplete
-        st.session_state.current_item_idx = 0
-        _recompute_global_status()
-        _jump_first_incomplete()
-        st.success(f"Loaded workbook. Run ID: {st.session_state.wb_state.run_id}")
+        digest = hashlib.sha1(file_bytes).hexdigest()
+
+        is_new_upload = (
+            st.session_state.wb_state is None
+            or st.session_state.upload_digest != digest
+            or st.session_state.upload_name != uploaded.name
+        )
+
+        if is_new_upload:
+            st.session_state.upload_name = uploaded.name
+            st.session_state.upload_digest = digest
+            st.session_state.wb_state = load_workbook_from_upload(file_bytes, cfg)
+
+            # On load: jump to first incomplete
+            st.session_state.current_item_idx = 0
+            _recompute_global_status()
+            _jump_first_incomplete()
+            st.success(f"Loaded workbook. Run ID: {st.session_state.wb_state.run_id}")
     except Exception as e:
         st.error(f"Failed to load workbook: {e}")
         st.stop()
@@ -382,13 +437,19 @@ _render_banner()
 
 # ---------------- Navigation header ----------------
 N_items = len(state.item_ids)
-def get_cur_idx():
-    idx = st.session_state.current_item_idx
-    return max(0, min(idx, N_items - 1))
 
 cur_idx = get_cur_idx()
 r = _get_row_index(cur_idx)
 cur_item_id = state.item_ids[cur_idx]
+
+if "jump_to_sentence_pending" in st.session_state:
+    st.session_state["jump_to_sentence"] = int(st.session_state.pop("jump_to_sentence_pending"))
+
+# Initialize jump box once (do not overwrite user edits)
+if "jump_to_sentence" not in st.session_state or st.session_state.get("jump_to_sentence") is None:
+    st.session_state["jump_to_sentence"] = int(cur_idx + 1)
+
+
 progress = f"Sentence {cur_idx + 1} / {N_items}"
 
 top_cols = st.columns([3, 2, 3, 2])
@@ -397,16 +458,26 @@ with top_cols[0]:
 
 with top_cols[1]:
     if cfg.ui_show_jump_to:
-        chosen = st.selectbox(
-            "Jump to",
-            options=state.item_ids,
-            index=cur_idx,
-            format_func=lambda x: f"item_id={x}",
+        def _on_jump_sentence_change():
+            # User enters 1-based sentence number; convert to 0-based index.
+            try:
+                target_idx = int(st.session_state["jump_to_sentence"]) - 1
+            except Exception:
+                target_idx = 0
+            st.session_state.current_item_idx = max(0, min(target_idx, N_items - 1))
+            # Keep the box synced to the new position
+            _set_jump_to_sentence(int(st.session_state.current_item_idx) + 1)
+            st.rerun()
+
+        st.number_input(
+            "Jump to sentence",
+            min_value=1,
+            max_value=max(1, N_items),
+            step=1,
+            key="jump_to_sentence",
+            on_change=_on_jump_sentence_change,
             label_visibility="collapsed",
         )
-        if chosen != cur_item_id:
-            _jump_to_item_id(int(chosen))
-            st.rerun()
 
 with top_cols[2]:
     qc = st.columns(2)
@@ -427,8 +498,6 @@ with top_cols[3]:
     _download_button("Download checkpoint")
 
 # ---------------- Load current row data ----------------
-
-
 source = str(inputs_ws.cell(row=r, column=ic["source"]).value or "")
 
 display_map_json = str(eval_ws.cell(row=r, column=ec["display_map_json"]).value or "")
@@ -478,28 +547,6 @@ for pos in range(1, cfg.num_translations + 1):
 
 # Helper: best->poor rank using bucket *keys* from config
 bucket_key_to_rank_best_first = {b.key: i for i, b in enumerate(cfg.buckets)}  # best=0 ... poor=3
-
-
-def _rank_for_pos(pos: int) -> Tuple[int, int, int]:
-    """
-    Sort key: (bucket_rank_best_first, -da, pos)
-    Unselected bucket goes to bottom.
-    """
-    bucket_label = st.session_state.get(f"bucket_pos_{cur_item_id}_{pos}", BUCKET_PLACEHOLDER)
-    if bucket_label == BUCKET_PLACEHOLDER:
-        bucket_rank = 999
-    else:
-        b_key = label_to_key.get(str(bucket_label))
-        bucket_rank = bucket_key_to_rank_best_first.get(b_key, 999)
-
-    da_val = st.session_state.get(f"da_val_{cur_item_id}_{pos}", cfg.da_min)
-    try:
-        da_i = int(da_val)
-    except Exception:
-        da_i = int(cfg.da_min)
-
-    return (bucket_rank, -da_i, pos)
-
 
 # Initialize session_state defaults from workbook for bucket + DA (so sorting works immediately)
 for pos, tcol, t_idx, text, existing_bucket_key, existing_da in pos_to_current:
@@ -623,6 +670,7 @@ with ctrl[0]:
     back_disabled = (cur_idx == 0)
     if cfg.ui_show_back and st.button("Back", disabled=back_disabled, use_container_width=True):
         st.session_state.current_item_idx = max(0, cur_idx - 1)
+        _set_jump_to_sentence(int(st.session_state.current_item_idx) + 1)
         st.rerun()
 
 with ctrl[1]:
@@ -645,11 +693,9 @@ with ctrl[2]:
         else:
             _write_eval_row(bucket_by_t, da_by_t)
             _recompute_global_status()
-        st.session_state.current_item_idx = cur_idx + 1
-        st.session_state.current_item_idx = min(
-            st.session_state.current_item_idx, N_items - 1
-        )
-        st.rerun()
+            st.session_state.current_item_idx = min(cur_idx + 1, N_items - 1)
+            _set_jump_to_sentence(int(st.session_state.current_item_idx) + 1)
+            st.rerun()
 
 
 # ---------------- Finish / Summary ----------------
@@ -660,7 +706,7 @@ st.divider()
 
 finish_cols = st.columns([2, 2, 8])
 with finish_cols[0]:
-    _download_button("Download current XLSX")
+    _download_button("Download checkpoint (xlsx)")
 
 with finish_cols[1]:
     if st.button("Finish", disabled=not (all_complete and no_invalid), use_container_width=True):
@@ -708,4 +754,8 @@ if cfg.ui_show_completion_summary and st.session_state.get("show_summary") and a
     st.markdown("### Time per sentence (seconds)")
     st.json(time_stats)
 
-    st.info("Download the final XLSX and send it to the research team. No per-system statistics are shown.")
+    st.info(
+            "Download the final XLSX and send it to the research team. No per-system statistics are shown.\n"
+            "The analysis is not complete until all you download the checkpoint .xslx file and send it to the research team.\n"
+            "The final .xlsx WILL NOT be available after you leave this screen, and all evaluations will be lost."
+            )
