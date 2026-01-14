@@ -1,0 +1,26 @@
+run:
+  num_translations: 12
+
+da:
+  min: 0
+  max: 100
+  integer_only: true
+
+buckets:
+  - key: best
+    label: Best
+  - key: good
+    label: Good
+  - key: ok
+    label: OK
+  - key: poor
+    label: Poor
+
+validation:
+  enforce_bucket_ordering: true
+  allow_empty_buckets: true
+
+ui:
+  show_back_button: true
+  show_jump_to: true
+  show_completion_summary: true
