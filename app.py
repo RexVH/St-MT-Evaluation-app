@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json
+import json, datetime as dt
 import hashlib
 from io import BytesIO
 from typing import Dict, List, Optional, Tuple
@@ -12,9 +12,17 @@ from mt_eval.xlsx_io import load_workbook_from_upload, save_workbook_to_bytes, n
 from mt_eval.validation import parse_display_map, validate_row, is_row_incomplete
 from mt_eval.hashing import compute_row_eval_hash
 from mt_eval.stats import aggregate_da_stats, time_per_sentence_seconds, summarize_times
-
+from mt_eval.instructions import instructions_md
 
 st.set_page_config(page_title="MT Human Evaluation", layout="wide")
+st.title("Machine Translation Human Evaluation")
+st.sidebar.page_link("app.py", label="Evaluation System", icon="📝")
+if st.query_params.get("type") == "admin":
+    st.sidebar.page_link(
+        r"pages\01_Generate_Template.py",
+        label="Generate Template (admin)",
+        icon="🧪",
+    )
 
 
 # ---------------- Session State ----------------
@@ -30,11 +38,14 @@ def ss_init():
     # Jump-to sentence number widget state
     st.session_state.setdefault("jump_to_sentence", 1)
 
-
 ss_init()
 
 
 # ---------------- Helpers ----------------
+def gts():
+    return dt.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+
+
 def _write_da_from_widget(widget_key: str, model_key: str):
     st.session_state[model_key] = int(st.session_state[widget_key])
 
@@ -62,8 +73,6 @@ def _soft_validate_live(cfg, bucket_by_t, da_by_t):
 def _get_row_index(item_idx: int) -> int:
     # openpyxl row index: header row is 1, first data row is 2
     return 2 + item_idx
-
-
 
 
 def _set_jump_to_sentence(n: int) -> None:
@@ -140,7 +149,6 @@ def _jump_to_item_id(target_item_id: int):
     _set_jump_to_sentence(int(new_idx + 1))
 
 
-
 def _jump_first_incomplete():
     inc = st.session_state.incomplete_item_ids
     if inc:
@@ -187,94 +195,94 @@ def _download_button(label: str):
     st.download_button(
         label=label,
         data=data,
-        file_name=fname.replace(".xlsx", "") + "_checkpoint.xlsx",
+        file_name=fname.replace(".xlsx", "") + f"_checkpoint__{gts()}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
 
 
-def _auto_order_da_by_bucket(
-    *,
-    cfg,
-    cur_item_id: int,
-    label_to_key: dict,
-    gap: int = 1,
-):
-    """
-    Rewrites DA values in session_state so that:
-      Poor < OK < Good < Best with strict separation (by >= gap)
+# def _auto_order_da_by_bucket(
+#     *,
+#     cfg,
+#     cur_item_id: int,
+#     label_to_key: dict,
+#     gap: int = 1,
+# ):
+#     """
+#     Rewrites DA values in session_state so that:
+#       Poor < OK < Good < Best with strict separation (by >= gap)
 
-    Only uses the bucket assignments already selected in the UI.
-    Writes ONLY to the model keys: da_val_{cur_item_id}_{pos}
-    """
-    high_to_low = [b.key for b in cfg.buckets]   # e.g. ["best","good","ok","poor"]
-    low_to_high = list(reversed(high_to_low))   # ["poor","ok","good","best"]
+#     Only uses the bucket assignments already selected in the UI.
+#     Writes ONLY to the model keys: da_val_{cur_item_id}_{pos}
+#     """
+#     high_to_low = [b.key for b in cfg.buckets]   # e.g. ["best","good","ok","poor"]
+#     low_to_high = list(reversed(high_to_low))   # ["poor","ok","good","best"]
 
-    placeholder = "Select…"
+#     placeholder = "Select…"
 
-    # items: (pos, bucket_key, cur_da)
-    items = []
-    for pos in range(1, cfg.num_translations + 1):
-        bucket_label = st.session_state.get(f"bucket_pos_{cur_item_id}_{pos}", placeholder)
-        if bucket_label == placeholder:
-            raise ValueError("All buckets must be selected before auto-ordering DA.")
-        b_key = label_to_key[str(bucket_label)]
+#     # items: (pos, bucket_key, cur_da)
+#     items = []
+#     for pos in range(1, cfg.num_translations + 1):
+#         bucket_label = st.session_state.get(f"bucket_pos_{cur_item_id}_{pos}", placeholder)
+#         if bucket_label == placeholder:
+#             raise ValueError("All buckets must be selected before auto-ordering DA.")
+#         b_key = label_to_key[str(bucket_label)]
 
-        da_model_key = f"da_val_{cur_item_id}_{pos}"
-        cur_da = st.session_state.get(da_model_key, cfg.da_min)
-        try:
-            cur_da = int(cur_da)
-        except Exception:
-            cur_da = int(cfg.da_min)
+#         da_model_key = f"da_val_{cur_item_id}_{pos}"
+#         cur_da = st.session_state.get(da_model_key, cfg.da_min)
+#         try:
+#             cur_da = int(cur_da)
+#         except Exception:
+#             cur_da = int(cfg.da_min)
 
-        items.append((pos, b_key, cur_da))
+#         items.append((pos, b_key, cur_da))
 
-    # Group by bucket (low->high), sort within bucket by current DA
-    grouped = {k: [] for k in low_to_high}
-    for pos, b_key, cur_da in items:
-        grouped[b_key].append((pos, cur_da))
+#     # Group by bucket (low->high), sort within bucket by current DA
+#     grouped = {k: [] for k in low_to_high}
+#     for pos, b_key, cur_da in items:
+#         grouped[b_key].append((pos, cur_da))
 
-    for b in low_to_high:
-        grouped[b].sort(key=lambda x: x[1])
+#     for b in low_to_high:
+#         grouped[b].sort(key=lambda x: x[1])
 
-    current_floor = int(cfg.da_min)
+#     current_floor = int(cfg.da_min)
 
-    for b in low_to_high:
-        bucket_items = grouped[b]
-        if not bucket_items:
-            continue
+#     for b in low_to_high:
+#         bucket_items = grouped[b]
+#         if not bucket_items:
+#             continue
 
-        # preserve relative spacing within bucket, but start at current_floor
-        das = [cur_da for _, cur_da in bucket_items]
-        base = das[0]
-        rel = [d - base for d in das]
-        proposed = [current_floor + r for r in rel]
+#         # preserve relative spacing within bucket, but start at current_floor
+#         das = [cur_da for _, cur_da in bucket_items]
+#         base = das[0]
+#         rel = [d - base for d in das]
+#         proposed = [current_floor + r for r in rel]
 
-        # clamp/compress into range if needed
-        max_allowed = int(cfg.da_max)
-        if proposed[-1] > max_allowed:
-            if len(proposed) == 1:
-                proposed = [min(max_allowed, current_floor)]
-            else:
-                span = proposed[-1] - proposed[0]
-                target_span = max_allowed - current_floor
-                if span <= 0:
-                    proposed = [current_floor for _ in proposed]
-                else:
-                    proposed = [int(round(current_floor + (r / span) * target_span)) for r in rel]
+#         # clamp/compress into range if needed
+#         max_allowed = int(cfg.da_max)
+#         if proposed[-1] > max_allowed:
+#             if len(proposed) == 1:
+#                 proposed = [min(max_allowed, current_floor)]
+#             else:
+#                 span = proposed[-1] - proposed[0]
+#                 target_span = max_allowed - current_floor
+#                 if span <= 0:
+#                     proposed = [current_floor for _ in proposed]
+#                 else:
+#                     proposed = [int(round(current_floor + (r / span) * target_span)) for r in rel]
 
-        # ensure non-decreasing after rounding
-        for i in range(1, len(proposed)):
-            if proposed[i] < proposed[i - 1]:
-                proposed[i] = proposed[i - 1]
+#         # ensure non-decreasing after rounding
+#         for i in range(1, len(proposed)):
+#             if proposed[i] < proposed[i - 1]:
+#                 proposed[i] = proposed[i - 1]
 
-        # write back to MODEL keys only
-        for (pos, _), newv in zip(bucket_items, proposed):
-            newv = max(int(cfg.da_min), min(int(cfg.da_max), int(newv)))
-            st.session_state[f"da_val_{cur_item_id}_{pos}"] = newv
+#         # write back to MODEL keys only
+#         for (pos, _), newv in zip(bucket_items, proposed):
+#             newv = max(int(cfg.da_min), min(int(cfg.da_max), int(newv)))
+#             st.session_state[f"da_val_{cur_item_id}_{pos}"] = newv
 
-        # next bucket must start >= (max in this bucket + gap)
-        current_floor = min(int(cfg.da_max), int(proposed[-1]) + int(gap))
+#         # next bucket must start >= (max in this bucket + gap)
+#         current_floor = min(int(cfg.da_max), int(proposed[-1]) + int(gap))
 
 
 # ---------------- Validate & Commit ----------------
@@ -368,8 +376,6 @@ def _rank_for_pos(pos: int) -> Tuple[int, int, int]:
     return (bucket_rank, -da_i, pos)
 
 # ---------------- UI: Upload / Init ----------------
-st.title("Machine Translation Human Evaluation")
-
 try:
     cfg = load_config("config.yaml")
     st.session_state.cfg = cfg
@@ -377,23 +383,28 @@ except Exception as e:
     st.error(f"Config error: {e}")
     st.stop()
 
-with st.expander("Run configuration (frozen for this run)", expanded=False):
-    st.json(
-        {
-            "num_translations": cfg.num_translations,
-            "da": {"min": cfg.da_min, "max": cfg.da_max, "integer_only": cfg.da_integer_only},
-            "buckets": [{"key": b.key, "label": b.label} for b in cfg.buckets],
-            "validation": {
-                "enforce_bucket_ordering": cfg.enforce_bucket_ordering,
-                "allow_empty_buckets": cfg.allow_empty_buckets,
-            },
-        }
+# with st.expander("Run configuration (frozen for this run)", expanded=False):
+#     st.json(
+#         {
+#             "num_translations": cfg.num_translations,
+#             "da": {"min": cfg.da_min, "max": cfg.da_max, "integer_only": cfg.da_integer_only},
+#             "buckets": [{"key": b.key, "label": b.label} for b in cfg.buckets],
+#             "validation": {
+#                 "enforce_bucket_ordering": cfg.enforce_bucket_ordering,
+#                 "allow_empty_buckets": cfg.allow_empty_buckets,
+#             },
+#         }
+#     )
+
+with st.expander("Important Instructions. Please Read First. (Click here to show/hide these instructions)", expanded=True):
+    st.markdown(
+        instructions_md
     )
 
 uploaded = st.file_uploader("Upload evaluation XLSX", type=["xlsx"], accept_multiple_files=False)
 
 if uploaded is None and st.session_state.wb_state is None:
-    st.info("Upload the researcher-provided XLSX to begin or resume.")
+    st.info("Please Upload the researcher-provided Excel .xslx file to begin or resume.")
     st.stop()
 
 # IMPORTANT: file_uploader retains its value across reruns. Only (re)load the workbook when
@@ -448,7 +459,6 @@ if "jump_to_sentence_pending" in st.session_state:
 # Initialize jump box once (do not overwrite user edits)
 if "jump_to_sentence" not in st.session_state or st.session_state.get("jump_to_sentence") is None:
     st.session_state["jump_to_sentence"] = int(cur_idx + 1)
-
 
 progress = f"Sentence {cur_idx + 1} / {N_items}"
 
@@ -637,22 +647,22 @@ for pos in positions:
             )
 
 
-auto_cols = st.columns([2, 8])
-with auto_cols[0]:
-    if st.button("Auto-order DA by bucket", use_container_width=True):
-        try:
-            _auto_order_da_by_bucket(
-                cfg=cfg,
-                cur_item_id=cur_item_id,
-                label_to_key=label_to_key,
-                gap=1,
-            )
-            # Force DA widgets to re-instantiate with updated model values
-            st.session_state[epoch_key] += 1
-            st.success("Re-ordered DA scores to respect bucket ordering.")
-            st.rerun()
-        except Exception as e:
-            st.error(str(e))
+# auto_cols = st.columns([2, 8])
+# with auto_cols[0]:
+#     if st.button("Auto-order DA by bucket", use_container_width=True):
+#         try:
+#             _auto_order_da_by_bucket(
+#                 cfg=cfg,
+#                 cur_item_id=cur_item_id,
+#                 label_to_key=label_to_key,
+#                 gap=1,
+#             )
+#             # Force DA widgets to re-instantiate with updated model values
+#             st.session_state[epoch_key] += 1
+#             st.success("Re-ordered DA scores to respect bucket ordering.")
+#             st.rerun()
+#         except Exception as e:
+#             st.error(str(e))
 
 st.markdown("### Comment (optional)")
 comment = st.text_area("Comment", value=str(comment_val), key=f"comment_{cur_item_id}", label_visibility="collapsed")

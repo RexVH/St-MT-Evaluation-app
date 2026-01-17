@@ -15,8 +15,6 @@ from openpyxl.utils import get_column_letter
 from mt_eval.config import load_config, RunConfig
 from mt_eval.hashing import compute_row_input_hash
 
-st.set_page_config(page_title="Generate Eval XLSX", layout="wide")
-
 
 # -----------------------------
 # Utilities
@@ -374,11 +372,27 @@ def repair_eval_sheet_in_place(wb: Workbook, cfg: RunConfig, rows: List[Tuple[in
 # -----------------------------
 # UI
 # -----------------------------
-
 st.title("Generate Evaluation XLSX")
+try:
+    cfg = load_config("config.yaml")
+    st.session_state.cfg = cfg
+except Exception as e:
+    st.error(f"Config error: {e}")
+    st.stop()
 
-cfg = load_config("config.yaml")
 st.caption(f"Configured for {cfg.num_translations} translations per sentence (t1..t{cfg.num_translations}).")
+with st.expander("Run configuration (frozen for this run)", expanded=False):
+    st.json(
+        {
+            "num_translations": cfg.num_translations,
+            "da": {"min": cfg.da_min, "max": cfg.da_max, "integer_only": cfg.da_integer_only},
+            "buckets": [{"key": b.key, "label": b.label} for b in cfg.buckets],
+            "validation": {
+                "enforce_bucket_ordering": cfg.enforce_bucket_ordering,
+                "allow_empty_buckets": cfg.allow_empty_buckets,
+            },
+        }
+    )
 
 tab1, tab2, tab3 = st.tabs(["Generate example (5 rows)", "Upload CSV → XLSX", "Upload XLSX → Repair/Rebuild"])
 
