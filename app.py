@@ -19,7 +19,7 @@ st.title("Machine Translation Human Evaluation")
 st.sidebar.page_link("app.py", label="Evaluation System", icon="📝")
 if st.query_params.get("type") == "admin":
     st.sidebar.page_link(
-        r"pages\01_Generate_Template.py",
+        "pages/01_Generate_Template.py",
         label="Generate Template (admin)",
         icon="🧪",
     )
