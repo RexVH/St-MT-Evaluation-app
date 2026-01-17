@@ -745,6 +745,14 @@ if cfg.ui_show_completion_summary and st.session_state.get("show_summary") and a
     da_stats = aggregate_da_stats(all_scores)
     time_stats = summarize_times(times)
 
+    st.info(
+            "PLEASE DOWNLOAD THE CHECKPOINT NOW. This is the only way to save your work!  \n\n"
+            "Download the final XLSX and send it to the research team.  \n"
+            "Reminder: The analysis is not complete until all you download the checkpoint .xslx file and send it to the research team.  \n"
+            "**The final .xlsx WILL NOT be available after you leave this screen, and all evaluations will be lost.**  \n\n"
+            "See the total information below. No per-system statistics are shown."
+            )
+
     st.markdown("### DA statistics (all translations pooled)")
     st.json(da_stats)
 
@@ -754,8 +762,3 @@ if cfg.ui_show_completion_summary and st.session_state.get("show_summary") and a
     st.markdown("### Time per sentence (seconds)")
     st.json(time_stats)
 
-    st.info(
-            "Download the final XLSX and send it to the research team. No per-system statistics are shown.\n"
-            "The analysis is not complete until all you download the checkpoint .xslx file and send it to the research team.\n"
-            "The final .xlsx WILL NOT be available after you leave this screen, and all evaluations will be lost."
-            )
