@@ -391,6 +391,8 @@ with st.expander("Run configuration (frozen for this run)", expanded=False):
                 "enforce_bucket_ordering": cfg.enforce_bucket_ordering,
                 "allow_empty_buckets": cfg.allow_empty_buckets,
             },
+            "da_intra_bucket_options": cfg.da_intra_bucket_options,
+            "bucket_colors": cfg.bucket_colors
         }
     )
 
