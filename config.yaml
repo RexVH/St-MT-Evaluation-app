@@ -24,3 +24,15 @@ ui:
   show_back_button: true
   show_jump_to: true
   show_completion_summary: true
+
+da_intra_bucket_options: 7
+
+bucket_colors:
+  - key: best
+    color: "#1E8E3E"    # green
+  - key: good
+    color: "#FB8C00"    # orange
+  - key: ok
+    color: "#1A73E8"    # blue
+  - key: poor
+    color: "#D93025"    # red

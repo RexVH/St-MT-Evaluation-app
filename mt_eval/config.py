@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
 import yaml
@@ -24,6 +24,9 @@ class RunConfig:
     ui_show_back: bool
     ui_show_jump_to: bool
     ui_show_completion_summary: bool
+    da_intra_bucket_options: int = 3
+    bucket_colors: dict = field(default_factory=dict)
+
 
     @property
     def bucket_keys(self) -> List[str]:
@@ -49,6 +52,7 @@ def load_config(path: str | Path = "config.yaml") -> RunConfig:
             ],
             "validation": {"enforce_bucket_ordering": True, "allow_empty_buckets": True},
             "ui": {"show_back_button": True, "show_jump_to": True, "show_completion_summary": True},
+            "da_intra_bucket_options": 3,
         }
     else:
         data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
@@ -63,12 +67,21 @@ def load_config(path: str | Path = "config.yaml") -> RunConfig:
     buckets_raw = _req(data, "buckets", "root")
     val = _req(data, "validation", "root")
     ui = _req(data, "ui", "root")
+    da_intra_bucket_options = _req(data, "da_intra_bucket_options", "root")
+    buckets_colors_raw = data.get("bucket_colors", {})
+
 
     buckets: List[Bucket] = []
     for b in buckets_raw:
         if "key" not in b or "label" not in b:
             raise ValueError("Each bucket must have {key, label}")
         buckets.append(Bucket(key=str(b["key"]), label=str(b["label"])))
+
+    buckets_colors: Dict[str, str] = {}
+    for b in buckets_colors_raw:
+        if "key" not in b or "color" not in b:
+            raise ValueError("Each color bucket must have {key, color}")
+        buckets_colors[str(b["key"])] = str(b["color"])
 
     cfg = RunConfig(
         num_translations=int(_req(run, "num_translations", "run")),
@@ -81,6 +94,8 @@ def load_config(path: str | Path = "config.yaml") -> RunConfig:
         ui_show_back=bool(_req(ui, "show_back_button", "ui")),
         ui_show_jump_to=bool(_req(ui, "show_jump_to", "ui")),
         ui_show_completion_summary=bool(_req(ui, "show_completion_summary", "ui")),
+        da_intra_bucket_options=int(data.get("da_intra_bucket_options", 3)),
+        bucket_colors=buckets_colors
     )
 
     # Basic invariants

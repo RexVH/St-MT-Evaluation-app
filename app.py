@@ -50,6 +50,53 @@ def _write_da_from_widget(widget_key: str, model_key: str):
     st.session_state[model_key] = int(st.session_state[widget_key])
 
 
+def _bucket_range_for_key(*, bucket_key: str, intra: int, bucket_order_best_first: List[str]) -> Tuple[int, int]:
+    """Return allowed DA (min,max) for a bucket.
+
+    bucket_order_best_first: e.g. ["best","good","ok","poor"].
+    DA ranges increase from poor->best.
+    Example (intra=3):
+      poor: 1-3, ok: 4-6, good: 7-9, best: 10-12
+    """
+    if intra <= 0:
+        intra = 1
+
+    if bucket_key not in bucket_order_best_first:
+        # Unknown bucket -> no restriction other than global range
+        return (1, max(1, 4 * intra))
+
+    best_first_rank = bucket_order_best_first.index(bucket_key)  # best=0..poor=3
+    low_to_high_rank = (len(bucket_order_best_first) - 1) - best_first_rank  # poor=0..best=3
+    mn = 1 + (low_to_high_rank * intra)
+    mx = mn + intra - 1
+    return (int(mn), int(mx))
+
+
+def _remap_da_between_buckets(*, old_da: int, old_range: Tuple[int, int], new_range: Tuple[int, int]) -> int:
+    """Map a DA value from one bucket range to another preserving relative position.
+
+    Because all buckets share the same intra-bucket size, we preserve the offset from
+    the old min (clamped) and apply it to the new min.
+    """
+    o_min, o_max = old_range
+    n_min, n_max = new_range
+
+    if o_max < o_min:
+        o_min, o_max = o_max, o_min
+    if n_max < n_min:
+        n_min, n_max = n_max, n_min
+
+    try:
+        v = int(old_da)
+    except Exception:
+        v = int(o_min)
+
+    v = max(int(o_min), min(int(o_max), v))
+    offset = v - int(o_min)
+    mapped = int(n_min) + int(offset)
+    return max(int(n_min), min(int(n_max), int(mapped)))
+
+
 def _soft_validate_live(cfg, bucket_by_t, da_by_t):
     """
     Live checks: bucket selected + DA in range.
@@ -383,18 +430,171 @@ except Exception as e:
     st.error(f"Config error: {e}")
     st.stop()
 
-# with st.expander("Run configuration (frozen for this run)", expanded=False):
-#     st.json(
-#         {
-#             "num_translations": cfg.num_translations,
-#             "da": {"min": cfg.da_min, "max": cfg.da_max, "integer_only": cfg.da_integer_only},
-#             "buckets": [{"key": b.key, "label": b.label} for b in cfg.buckets],
-#             "validation": {
-#                 "enforce_bucket_ordering": cfg.enforce_bucket_ordering,
-#                 "allow_empty_buckets": cfg.allow_empty_buckets,
-#             },
-#         }
-#     )
+# --- Derived DA ranges based on intra-bucket options (quartiles)
+# New YAML keys (recommended):
+#   da_intra_bucket_options: <int>
+#   bucket_colors:
+#     best: {bg: "#...", border: "#..."}
+#     good: {bg: "#...", border: "#..."}
+#     ok:   {bg: "#...", border: "#..."}
+#     poor: {bg: "#...", border: "#..."}
+bucket_order_best_first = [b.key for b in cfg.buckets]
+
+da_intra = getattr(cfg, "da_intra_bucket_options", None)
+if da_intra is None:
+    # Safe default to keep the app functional if config hasn't been updated yet.
+    da_intra = 3
+    st.warning(
+        "config.yaml is missing 'da_intra_bucket_options'. Defaulting to 3. "
+        "Add it to control the slider ranges.",
+        icon="⚠️",
+    )
+
+try:
+    da_intra = int(da_intra)
+except Exception:
+    da_intra = 3
+
+da_intra = max(1, da_intra)
+
+# Force DA global range to match 4 buckets * intra options, and keep integer-only semantics.
+derived_da_min = 1
+derived_da_max = int(len(bucket_order_best_first) * da_intra)
+try:
+    setattr(cfg, "da_min", int(derived_da_min))
+    setattr(cfg, "da_max", int(derived_da_max))
+except Exception:
+    # If cfg is immutable, we still use the derived values locally in the UI.
+    pass
+
+# Default bucket colors (tinted bg + strong border)
+default_bucket_colors = {
+    "best": {"bg": "#E9F7EF", "border": "#1E8E3E"},   # green
+    "good": {"bg": "#FFF4E5", "border": "#FB8C00"},   # orange
+    "ok":   {"bg": "#E8F1FF", "border": "#1A73E8"},   # blue
+    "poor": {"bg": "#FDECEC", "border": "#D93025"},   # red
+}
+bucket_colors = getattr(cfg, "bucket_colors", None) or default_bucket_colors
+
+# Global CSS for bucket highlighting.
+# IMPORTANT: Only change border color (no background tint), and scope selectors tightly
+# so we don't accidentally style large parent blocks.
+st.markdown(
+    """
+<style>
+    .bucket-marker { display:none; }
+
+/* Remove vertical margins added by st.markdown for bucket title */
+div[data-testid="stLayoutWrapper"]:has(span.mt-card-hook)
+  .bucket-title {
+    display: inline-block;
+    margin: 0 !important;
+    padding: 0 !important;
+    line-height: 1.0;
+}
+
+/* Tighten padding inside bordered containers used as MT cards */
+/* Make hook span layout-neutral */
+    .mt-card-hook {
+    display: block;
+    height: 0;
+    margin: 0 !important;
+    padding: 0 !important;
+    }
+
+/* Tighten padding inside MT cards */
+    div[data-testid="stLayoutWrapper"]:has(span.mt-card-hook) > div {
+    padding: 0.0rem 0.75rem !important;
+    }
+
+/* Remove top margin from first child inside card */
+    div[data-testid="stLayoutWrapper"]:has(span.mt-card-hook)
+    > div
+    > *:first-child {
+        margin-top: 0 !important;
+    }
+
+/* Kill the element spacing that Streamlit adds around markdown blocks INSIDE a card */
+    div[data-testid="stLayoutWrapper"]:has(span.mt-card-hook) .element-container {
+    margin-top: 0 !important;
+    margin-bottom: 0 !important;
+    }
+
+    div[data-testid="stLayoutWrapper"]:has(span.mt-card-hook) div[data-testid="stMarkdownContainer"] {
+    margin-top: 0 !important;
+    margin-bottom: 0 !important;
+    padding-top: 0 !important;
+    padding-bottom: 0 !important;
+    }
+
+/* Also remove the default paragraph margin inside that markdown container */
+    div[data-testid="stLayoutWrapper"]:has(span.mt-card-hook) div[data-testid="stMarkdownContainer"] p {
+    margin-top: 0 !important;
+    margin-bottom: 0 !important; /* tweak to taste */
+    }
+
+div[data-testid="stLayoutWrapper"]:has(span.mt-card-hook) .mt-translation {
+  margin: 0 0 0 0;
+  padding: 0;
+}
+
+/* Style the wrapper that actually exists around each translation "card" */
+    div[data-testid="stLayoutWrapper"]:has(span.mt-card-hook):has(span.bucket-marker.bucket-best) {
+        border-radius: 12px;
+        border: 2px solid transparent;
+    }
+    div[data-testid="stLayoutWrapper"]:has(span.mt-card-hook):has(span.bucket-marker.bucket-good) {
+    border-radius: 12px;
+    border: 2px solid transparent;
+    }
+    div[data-testid="stLayoutWrapper"]:has(span.mt-card-hook):has(span.bucket-marker.bucket-ok) {
+        border-radius: 12px;
+        border: 2px solid transparent;
+    }
+    div[data-testid="stLayoutWrapper"]:has(span.mt-card-hook):has(span.bucket-marker.bucket-poor) {
+        border-radius: 12px;
+        border: 2px solid transparent;
+    }
+
+    div[data-testid="stLayoutWrapper"]:has(span.bucket-marker.bucket-best) { border-color: var(--best-border) !important; }
+    div[data-testid="stLayoutWrapper"]:has(span.bucket-marker.bucket-good) { border-color: var(--good-border) !important; }
+    div[data-testid="stLayoutWrapper"]:has(span.bucket-marker.bucket-ok)   { border-color: var(--ok-border)   !important; }
+    div[data-testid="stLayoutWrapper"]:has(span.bucket-marker.bucket-poor) { border-color: var(--poor-border) !important; }
+
+    .bucket-title { font-weight: 700; }
+    div[data-testid="stLayoutWrapper"]:has(span.bucket-marker.bucket-best) .bucket-title { color: var(--best-border) !important; }
+    div[data-testid="stLayoutWrapper"]:has(span.bucket-marker.bucket-good) .bucket-title { color: var(--good-border) !important; }
+    div[data-testid="stLayoutWrapper"]:has(span.bucket-marker.bucket-ok)   .bucket-title { color: var(--ok-border)   !important; }
+    div[data-testid="stLayoutWrapper"]:has(span.bucket-marker.bucket-poor) .bucket-title { color: var(--poor-border) !important; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+# Set CSS variables from config / defaults
+def _css_var_block(colors: dict) -> str:
+    def g(k, field, fallback):
+        try:
+            return str(colors.get(k, {}).get(field, fallback))
+        except Exception:
+            return str(fallback)
+
+    return f"""
+<style>
+  :root {{
+    --best-bg: {g('best','bg', default_bucket_colors['best']['bg'])};
+    --best-border: {g('best','border', default_bucket_colors['best']['border'])};
+    --good-bg: {g('good','bg', default_bucket_colors['good']['bg'])};
+    --good-border: {g('good','border', default_bucket_colors['good']['border'])};
+    --ok-bg: {g('ok','bg', default_bucket_colors['ok']['bg'])};
+    --ok-border: {g('ok','border', default_bucket_colors['ok']['border'])};
+    --poor-bg: {g('poor','bg', default_bucket_colors['poor']['bg'])};
+    --poor-border: {g('poor','border', default_bucket_colors['poor']['border'])};
+  }}
+</style>
+"""
+
+st.markdown(_css_var_block(bucket_colors), unsafe_allow_html=True)
 
 with st.expander("Important Instructions. Please Read First. (Click here to show/hide these instructions)", expanded=True):
     st.markdown(
@@ -526,10 +726,8 @@ epoch_key = f"da_widget_epoch_{cur_item_id}"
 st.session_state.setdefault(epoch_key, 0)
 
 # ---------------- Main UI ----------------
-st.markdown("### Source")
-st.write(source)
-
-st.markdown("### Translations (blind, grouped by bucket)")
+st.markdown(f"<span style='margin-top:-0.5rem;font-weight:bold'>Source:</span><span style='margin-top:-0.5rem; font-weight:normal'> {source}</span>", unsafe_allow_html=True)
+st.markdown(f"<span style='margin-top:-0.5rem;font-weight:bold'>Translations:</span><span style='margin-top:-0.5rem; font-weight:normal'> (blind, grouped by bucket)", unsafe_allow_html=True)
 
 bucket_labels = [b.label for b in cfg.buckets]
 label_to_key = {b.label: b.key for b in cfg.buckets}
@@ -584,11 +782,20 @@ for pos in positions:
             _, tcol, t_idx, text, existing_bucket_key, existing_da = tup
             break
 
+    # Determine current bucket key (for styling + slider range)
+    bucket_label_current = st.session_state.get(f"bucket_pos_{cur_item_id}_{pos}", BUCKET_PLACEHOLDER)
+    bucket_key_current = label_to_key.get(str(bucket_label_current)) if bucket_label_current != BUCKET_PLACEHOLDER else None
+
     with st.container(border=True):
+        # Marker used by CSS (:has) to tint this whole block by bucket
+        # Note: keep marker inside the container.
+        st.markdown(f"<span class='mt-card-hook'></span><span class='bucket-marker bucket-{bucket_key_current}'></span>", unsafe_allow_html=True)
+
         col1, col2 = st.columns([1, 1], vertical_alignment="top")
         with col1:
-            st.markdown(f"**{pos}) {source}**")
-            st.write(text)
+            st.markdown(f"<span class='bucket-title'>{source}</span>", unsafe_allow_html=True)
+            st.markdown(f"<div class='mt-translation'>{text}</div>", unsafe_allow_html=True)
+            #st.write(text)
 
             # --- Keys
             bucket_key = f"bucket_pos_{cur_item_id}_{pos}"
@@ -610,59 +817,109 @@ for pos in positions:
             else:
                 bucket_default_idx = 0
 
+            # Track previous bucket for DA remapping when the bucket changes
+            prev_bucket_key_state = f"prev_bucket_key_{cur_item_id}_{pos}"
+            if prev_bucket_key_state not in st.session_state:
+                prev = label_to_key.get(str(bucket_label_current)) if bucket_label_current != BUCKET_PLACEHOLDER else None
+                st.session_state[prev_bucket_key_state] = prev
+
+            def _on_bucket_change(_pos=pos):
+                bkey = f"bucket_pos_{cur_item_id}_{_pos}"
+                dkey = f"da_val_{cur_item_id}_{_pos}"
+                prev_key_state = f"prev_bucket_key_{cur_item_id}_{_pos}"
+
+                new_label = st.session_state.get(bkey, BUCKET_PLACEHOLDER)
+                new_bucket_key = label_to_key.get(str(new_label)) if new_label != BUCKET_PLACEHOLDER else None
+                old_bucket_key = st.session_state.get(prev_key_state)
+
+                # Remap only when both old and new are real buckets
+                try:
+                    old_da = int(st.session_state.get(dkey, int(cfg.da_min)))
+                except Exception:
+                    old_da = int(cfg.da_min)
+
+                if new_bucket_key in bucket_order_best_first:
+                    new_rng = _bucket_range_for_key(
+                        bucket_key=str(new_bucket_key),
+                        intra=int(da_intra),
+                        bucket_order_best_first=bucket_order_best_first,
+                    )
+
+                    if old_bucket_key in bucket_order_best_first:
+                        old_rng = _bucket_range_for_key(
+                            bucket_key=str(old_bucket_key),
+                            intra=int(da_intra),
+                            bucket_order_best_first=bucket_order_best_first,
+                        )
+                        new_da = _remap_da_between_buckets(old_da=old_da, old_range=old_rng, new_range=new_rng)
+                    else:
+                        # No old bucket: keep the within-bucket offset based on current DA
+                        offset = (max(1, old_da) - 1) % int(da_intra)
+                        new_da = int(new_rng[0]) + int(offset)
+
+                    st.session_state[dkey] = int(new_da)
+
+                # Update prev bucket + bump epoch so the slider can re-instantiate with new min/max
+                st.session_state[prev_key_state] = new_bucket_key
+                st.session_state[epoch_key] = int(st.session_state.get(epoch_key, 0)) + 1
+
             st.radio(
                 f"Bucket {pos}",
                 options=bucket_options,
                 index=bucket_default_idx,
                 horizontal=True,
                 key=bucket_key,
+                on_change=_on_bucket_change,
                 label_visibility="collapsed",
             )
 
         with col2:
-            st.write(f"Input the direct assessment (DA) score for translation {pos} as an integer and press <Enter>.")
-            # Number input = SOURCE OF TRUTH
-            st.number_input(
-                f"DA {pos}",
-                min_value=int(cfg.da_min),
-                max_value=int(cfg.da_max),
-                step=1,
-                value=int(st.session_state[da_model_key]),
-                key=f"da_number_{cur_item_id}_{pos}",
-                on_change=lambda k=f"da_number_{cur_item_id}_{pos}", m=da_model_key: (
-                    st.session_state.__setitem__(m, int(st.session_state[k]))
-                ),
-                label_visibility="collapsed",
-            )
+            # Slider = SOURCE OF TRUTH (range is restricted by the chosen bucket)
+            bucket_label_for_slider = st.session_state.get(bucket_key, BUCKET_PLACEHOLDER)
+            bucket_key_for_slider = label_to_key.get(str(bucket_label_for_slider)) if bucket_label_for_slider != BUCKET_PLACEHOLDER else None
 
-            # Slider = MIRROR (read-only)
+            if bucket_key_for_slider in bucket_order_best_first:
+                s_min, s_max = _bucket_range_for_key(
+                    bucket_key=str(bucket_key_for_slider),
+                    intra=int(da_intra),
+                    bucket_order_best_first=bucket_order_best_first,
+                )
+                slider_disabled = False
+                slider_help = None
+            else:
+                # Disabled until a bucket is selected
+                s_min, s_max = int(cfg.da_min), int(cfg.da_min) + int(da_intra) - 1
+                slider_disabled = True
+                slider_help = "Choose a quartile bucket to enable the slider"
+
+            # Clamp current model value into the slider range before rendering
+            try:
+                cur_da_model = int(st.session_state.get(da_model_key, int(cfg.da_min)))
+            except Exception:
+                cur_da_model = int(cfg.da_min)
+            cur_da_model = max(int(s_min), min(int(s_max), int(cur_da_model)))
+            st.session_state[da_model_key] = int(cur_da_model)
+
+            def _on_da_slider_change(_skey: str, _mkey: str):
+                try:
+                    st.session_state[_mkey] = int(st.session_state[_skey])
+                except Exception:
+                    pass
+            
+            st.write("Enter the direct assessment score for this translation (Note: Range changes based on quartile):")
             st.slider(
-                f"DA slider {pos}",
-                min_value=int(cfg.da_min),
-                max_value=int(cfg.da_max),
+                f"DA {pos}",
+                min_value=int(s_min),
+                max_value=int(s_max),
                 step=1,
-                value=int(st.session_state[da_model_key]),
-                disabled=True,
+                value=int(cur_da_model),
+                key=da_slider_wkey,
+                on_change=lambda sk=da_slider_wkey, mk=da_model_key: _on_da_slider_change(sk, mk),
+                disabled=slider_disabled,
+                help=slider_help,
                 label_visibility="collapsed",
             )
 
-
-# auto_cols = st.columns([2, 8])
-# with auto_cols[0]:
-#     if st.button("Auto-order DA by bucket", use_container_width=True):
-#         try:
-#             _auto_order_da_by_bucket(
-#                 cfg=cfg,
-#                 cur_item_id=cur_item_id,
-#                 label_to_key=label_to_key,
-#                 gap=1,
-#             )
-#             # Force DA widgets to re-instantiate with updated model values
-#             st.session_state[epoch_key] += 1
-#             st.success("Re-ordered DA scores to respect bucket ordering.")
-#             st.rerun()
-#         except Exception as e:
-#             st.error(str(e))
 
 st.markdown("### Comment (optional)")
 comment = st.text_area("Comment", value=str(comment_val), key=f"comment_{cur_item_id}", label_visibility="collapsed")
@@ -675,7 +932,7 @@ if live_reasons:
     st.warning("Current sentence issues:\n- " + "\n- ".join(live_reasons))
 
 # Controls
-ctrl = st.columns([1, 1, 1, 6])
+ctrl = st.columns([1, 1, 1, 4])
 with ctrl[0]:
     back_disabled = (cur_idx == 0)
     if cfg.ui_show_back and st.button("Back", disabled=back_disabled, use_container_width=True):
@@ -689,7 +946,7 @@ with ctrl[1]:
         _recompute_global_status()
 
 with ctrl[2]:
-    if st.button("Next", use_container_width=True, type="primary"):
+    if st.button("Next", key="next_btn", use_container_width=True, type="primary"):
         bucket_by_t, da_by_t = _collect_current_inputs()
         ok, commit_reasons = validate_row(
             cfg=cfg,
@@ -707,7 +964,6 @@ with ctrl[2]:
             _set_jump_to_sentence(int(st.session_state.current_item_idx) + 1)
             st.rerun()
 
-
 # ---------------- Finish / Summary ----------------
 all_complete = (len(st.session_state.incomplete_item_ids) == 0)
 no_invalid = (len(st.session_state.invalid_item_ids) == 0)
@@ -719,7 +975,7 @@ with finish_cols[0]:
     _download_button("Download checkpoint (xlsx)")
 
 with finish_cols[1]:
-    if st.button("Finish", disabled=not (all_complete and no_invalid), use_container_width=True):
+    if st.button("Finish", disabled=not (all_complete and no_invalid), use_container_width=True, type="primary"):
         st.session_state["show_summary"] = True
 
 if cfg.ui_show_completion_summary and st.session_state.get("show_summary") and all_complete and no_invalid:
@@ -771,4 +1027,7 @@ if cfg.ui_show_completion_summary and st.session_state.get("show_summary") and a
 
     st.markdown("### Time per sentence (seconds)")
     st.json(time_stats)
+
+
+
 
