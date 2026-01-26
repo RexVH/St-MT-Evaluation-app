@@ -385,7 +385,7 @@ with st.expander("Run configuration (frozen for this run)", expanded=False):
     st.json(
         {
             "num_translations": cfg.num_translations,
-            "da": {"min": cfg.da_min, "max": cfg.da_max, "integer_only": cfg.da_integer_only},
+            #"da": {"min": cfg.da_min, "max": cfg.da_max, "integer_only": cfg.da_integer_only},
             "buckets": [{"key": b.key, "label": b.label} for b in cfg.buckets],
             "validation": {
                 "enforce_bucket_ordering": cfg.enforce_bucket_ordering,
