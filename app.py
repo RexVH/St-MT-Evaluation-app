@@ -727,7 +727,7 @@ st.session_state.setdefault(epoch_key, 0)
 
 # ---------------- Main UI ----------------
 st.markdown(f"<span style='margin-top:-0.5rem;font-weight:bold'>Source:</span><span style='margin-top:-0.5rem; font-weight:normal'> {source}</span>", unsafe_allow_html=True)
-st.markdown(f"<span style='margin-top:-0.5rem;font-weight:bold'>Translations:</span><span style='margin-top:-0.5rem; font-weight:normal'> (blind, grouped by bucket)", unsafe_allow_html=True)
+#st.markdown(f"<span style='margin-top:-0.5rem;font-weight:bold'>Translations:</span><span style='margin-top:-0.5rem; font-weight:normal'> (blind, grouped by bucket)", unsafe_allow_html=True)
 
 bucket_labels = [b.label for b in cfg.buckets]
 label_to_key = {b.label: b.key for b in cfg.buckets}
@@ -793,10 +793,9 @@ for pos in positions:
 
         col1, col2 = st.columns([1, 1], vertical_alignment="top")
         with col1:
-            st.markdown(f"<span class='bucket-title'>{source}</span>", unsafe_allow_html=True)
+            st.markdown(f"<span class='bucket-title'>{pos}) {source}</span>", unsafe_allow_html=True)
             st.markdown(f"<div class='mt-translation'>{text}</div>", unsafe_allow_html=True)
-            #st.write(text)
-
+            
             # --- Keys
             bucket_key = f"bucket_pos_{cur_item_id}_{pos}"
 
