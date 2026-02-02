@@ -41,22 +41,6 @@ def ss_init():
 ss_init()
 
 
-# Global UI placeholder (used by ordering + draft sync)
-BUCKET_PLACEHOLDER = "Select…"
-
-def _ss_key(*parts: object) -> str:
-    return "__".join(str(p) for p in parts)
-
-
-def _get_order_key(item_id: int) -> str:
-    return _ss_key("display_order", item_id)
-
-
-def _get_order_grouped_key(item_id: int) -> str:
-    # Tracks whether the current display order is known to be bucket-grouped.
-    return _ss_key("display_order_is_grouped", item_id)
-
-
 # ---------------- Helpers ----------------
 def gts():
     return dt.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
@@ -138,70 +122,6 @@ def _get_row_index(item_idx: int) -> int:
     return 2 + item_idx
 
 
-def _sync_current_row_draft_to_workbook() -> None:
-    """Write *draft* UI state for the current sentence into the workbook.
-
-    This is intentionally NOT a commit:
-    - does NOT set committed_at
-    - does NOT set row_eval_hash
-
-    It only exists so that navigation (Back/Jump) and checkpoint downloads can
-    preserve in-progress work on the current sentence.
-    """
-    state = st.session_state.get("wb_state")
-    cfg: RunConfig = st.session_state.get("cfg")
-    if state is None or cfg is None:
-        return
-
-    cur_idx = int(st.session_state.get("current_item_idx", 0))
-    if cur_idx < 0 or cur_idx >= len(state.item_ids):
-        return
-    cur_item_id = int(state.item_ids[cur_idx])
-
-    # Only sync if the user has touched something for this sentence.
-    touched = False
-    for pos in range(1, cfg.num_translations + 1):
-        if f"bucket_pos_{cur_item_id}_{pos}" in st.session_state or f"da_val_{cur_item_id}_{pos}" in st.session_state:
-            touched = True
-            break
-    if (not touched) and (f"comment_{cur_item_id}" not in st.session_state):
-        return
-
-    eval_ws = state.wb[state.eval_ws_name]
-    ec = state.eval_col
-    rr = _get_row_index(cur_idx)
-
-    dm_json = str(eval_ws.cell(row=rr, column=ec["display_map_json"]).value or "")
-    if not dm_json:
-        return
-    dm = parse_display_map(dm_json, cfg.num_translations)  # pos -> "t7"
-
-    label_to_key = {b.label: b.key for b in cfg.buckets}
-
-    for pos in range(1, cfg.num_translations + 1):
-        tcol = dm[pos]
-        t_idx = int(tcol[1:])
-
-        # Bucket: UI stores label; workbook stores key
-        b_label = st.session_state.get(f"bucket_pos_{cur_item_id}_{pos}", BUCKET_PLACEHOLDER)
-        b_key = ""
-        if b_label and str(b_label) != BUCKET_PLACEHOLDER:
-            b_key = label_to_key.get(str(b_label), "") or ""
-        eval_ws.cell(row=rr, column=ec[f"bucket_t{t_idx}"]).value = str(b_key)
-
-        # DA
-        d_val = st.session_state.get(f"da_val_{cur_item_id}_{pos}")
-        try:
-            d_int = int(d_val) if d_val is not None else None
-        except Exception:
-            d_int = None
-        eval_ws.cell(row=rr, column=ec[f"da_t{t_idx}"]).value = d_int
-
-    # Comment
-    if f"comment_{cur_item_id}" in st.session_state:
-        eval_ws.cell(row=rr, column=ec["comment"]).value = str(st.session_state.get(f"comment_{cur_item_id}") or "")
-
-
 def _set_jump_to_sentence(n: int) -> None:
     """
     Defer updating the jump-to widget value until the *next* rerun.
@@ -268,15 +188,11 @@ def _recompute_global_status():
 
 
 def _jump_to_item_id(target_item_id: int):
-    # Preserve any uncommitted work on the current sentence before navigating.
-    _sync_current_row_draft_to_workbook()
-
     state = st.session_state.wb_state
     if target_item_id not in state.item_ids:
         return
     new_idx = state.item_ids.index(target_item_id)
     st.session_state.current_item_idx = new_idx
-    st.session_state["pending_hydrate_item_id"] = int(target_item_id)
     _set_jump_to_sentence(int(new_idx + 1))
 
 
@@ -320,7 +236,6 @@ def _render_banner():
 
 
 def _download_button(label: str):
-    _sync_all_rows_draft_to_workbook(clear_commit_if_changed=True)
     state = st.session_state.wb_state
     data = save_workbook_to_bytes(state)
     fname = st.session_state.upload_name or "mt_eval_checkpoint.xlsx"
@@ -333,187 +248,88 @@ def _download_button(label: str):
     )
 
 
+# def _auto_order_da_by_bucket(
+#     *,
+#     cfg,
+#     cur_item_id: int,
+#     label_to_key: dict,
+#     gap: int = 1,
+# ):
+#     """
+#     Rewrites DA values in session_state so that:
+#       Poor < OK < Good < Best with strict separation (by >= gap)
 
+#     Only uses the bucket assignments already selected in the UI.
+#     Writes ONLY to the model keys: da_val_{cur_item_id}_{pos}
+#     """
+#     high_to_low = [b.key for b in cfg.buckets]   # e.g. ["best","good","ok","poor"]
+#     low_to_high = list(reversed(high_to_low))   # ["poor","ok","good","best"]
 
-def _sync_row_draft_to_workbook(
-    *,
-    item_idx: int,
-    item_id: int,
-    clear_commit_if_changed: bool,
-) -> None:
-    """Persist UI selections for a specific sentence into the workbook.
+#     placeholder = "Select…"
 
-    This writes *whatever the rater currently has in session_state* (bucket/DA/comment)
-    into the XLSX so that checkpoints truly capture the current work-in-progress.
+#     # items: (pos, bucket_key, cur_da)
+#     items = []
+#     for pos in range(1, cfg.num_translations + 1):
+#         bucket_label = st.session_state.get(f"bucket_pos_{cur_item_id}_{pos}", placeholder)
+#         if bucket_label == placeholder:
+#             raise ValueError("All buckets must be selected before auto-ordering DA.")
+#         b_key = label_to_key[str(bucket_label)]
 
-    If `clear_commit_if_changed` is True and the row was previously committed, we clear
-    committed_at + row_eval_hash when we detect any change. This keeps semantics sane:
-    edits are saved in the checkpoint, but the row is no longer considered 'committed'
-    until the rater clicks Next again.
-    """
-    state = st.session_state.wb_state
-    cfg: RunConfig = st.session_state.cfg
-    if state is None or cfg is None:
-        return
+#         da_model_key = f"da_val_{cur_item_id}_{pos}"
+#         cur_da = st.session_state.get(da_model_key, cfg.da_min)
+#         try:
+#             cur_da = int(cur_da)
+#         except Exception:
+#             cur_da = int(cfg.da_min)
 
-    rr = _get_row_index(int(item_idx))
-    _eval_ws = state.wb[state.eval_ws_name]
-    _ec = state.eval_col
+#         items.append((pos, b_key, cur_da))
 
-    # Only sync rows the user has actually touched in this session.
-    # (Otherwise we'd overwrite workbook values with placeholders.)
-    touched = False
-    for pos in range(1, cfg.num_translations + 1):
-        if f"bucket_pos_{item_id}_{pos}" in st.session_state:
-            touched = True
-            break
-        if f"da_val_{item_id}_{pos}" in st.session_state:
-            touched = True
-            break
-    if (not touched) and (f"comment_{item_id}" not in st.session_state):
-        return
+#     # Group by bucket (low->high), sort within bucket by current DA
+#     grouped = {k: [] for k in low_to_high}
+#     for pos, b_key, cur_da in items:
+#         grouped[b_key].append((pos, cur_da))
 
-    committed_before = _eval_ws.cell(row=rr, column=_ec["committed_at"]).value
+#     for b in low_to_high:
+#         grouped[b].sort(key=lambda x: x[1])
 
-    # Need display_map to map display pos -> canonical t#
-    dm_json = str(_eval_ws.cell(row=rr, column=_ec["display_map_json"]).value or "")
-    if not dm_json:
-        return
-    dm = parse_display_map(dm_json, cfg.num_translations)
+#     current_floor = int(cfg.da_min)
 
-    # Label->key mapping (label is stored in UI; key is stored in XLSX)
-    _label_to_key = {b.label: b.key for b in cfg.buckets}
-    placeholder = BUCKET_PLACEHOLDER
+#     for b in low_to_high:
+#         bucket_items = grouped[b]
+#         if not bucket_items:
+#             continue
 
-    changed = False
+#         # preserve relative spacing within bucket, but start at current_floor
+#         das = [cur_da for _, cur_da in bucket_items]
+#         base = das[0]
+#         rel = [d - base for d in das]
+#         proposed = [current_floor + r for r in rel]
 
-    for pos in range(1, cfg.num_translations + 1):
-        tcol = dm[pos]          # e.g. "t7"
-        t_idx = int(tcol[1:])   # 7
+#         # clamp/compress into range if needed
+#         max_allowed = int(cfg.da_max)
+#         if proposed[-1] > max_allowed:
+#             if len(proposed) == 1:
+#                 proposed = [min(max_allowed, current_floor)]
+#             else:
+#                 span = proposed[-1] - proposed[0]
+#                 target_span = max_allowed - current_floor
+#                 if span <= 0:
+#                     proposed = [current_floor for _ in proposed]
+#                 else:
+#                     proposed = [int(round(current_floor + (r / span) * target_span)) for r in rel]
 
-        # Bucket (UI stores label; XLSX stores key)
-        b_label = st.session_state.get(f"bucket_pos_{item_id}_{pos}", placeholder)
-        b_key = ""
-        if b_label and str(b_label) != placeholder:
-            b_key = _label_to_key.get(str(b_label), "") or ""
+#         # ensure non-decreasing after rounding
+#         for i in range(1, len(proposed)):
+#             if proposed[i] < proposed[i - 1]:
+#                 proposed[i] = proposed[i - 1]
 
-        cell_bucket = str(_eval_ws.cell(row=rr, column=_ec[f"bucket_t{t_idx}"]).value or "")
-        if cell_bucket != str(b_key):
-            changed = True
-            _eval_ws.cell(row=rr, column=_ec[f"bucket_t{t_idx}"]).value = str(b_key)
+#         # write back to MODEL keys only
+#         for (pos, _), newv in zip(bucket_items, proposed):
+#             newv = max(int(cfg.da_min), min(int(cfg.da_max), int(newv)))
+#             st.session_state[f"da_val_{cur_item_id}_{pos}"] = newv
 
-        # DA
-        d_val = st.session_state.get(f"da_val_{item_id}_{pos}")
-        try:
-            d_int = int(d_val) if d_val is not None else None
-        except Exception:
-            d_int = None
-
-        cell_da = _eval_ws.cell(row=rr, column=_ec[f"da_t{t_idx}"]).value
-        try:
-            cell_da_int = int(cell_da) if cell_da is not None and str(cell_da).strip() != "" else None
-        except Exception:
-            cell_da_int = None
-
-        if cell_da_int != d_int:
-            changed = True
-            _eval_ws.cell(row=rr, column=_ec[f"da_t{t_idx}"]).value = d_int
-
-    # Comment (draft)
-    c = st.session_state.get(f"comment_{item_id}", None)
-    if c is not None:
-        c_str = str(c or "")
-        cell_c = str(_eval_ws.cell(row=rr, column=_ec["comment"]).value or "")
-        if cell_c != c_str:
-            changed = True
-            _eval_ws.cell(row=rr, column=_ec["comment"]).value = c_str
-
-    if clear_commit_if_changed and committed_before and changed:
-        # Preserve started_at, edit_count, etc. but mark "needs re-commit".
-        _eval_ws.cell(row=rr, column=_ec["committed_at"]).value = ""
-        _eval_ws.cell(row=rr, column=_ec["row_eval_hash"]).value = ""
-
-
-def _sync_all_rows_draft_to_workbook(*, clear_commit_if_changed: bool = True) -> None:
-    """Sync all rows the user has touched this session into the workbook.
-
-    This makes 'Save (checkpoint)' and 'Download checkpoint' behave like users expect:
-    the checkpoint XLSX reflects *everything you've entered/edited so far*, even if you
-    navigated back to earlier sentences and haven't clicked Next again.
-    """
-    state = st.session_state.wb_state
-    cfg: RunConfig = st.session_state.cfg
-    if state is None or cfg is None:
-        return
-
-    for idx, item_id in enumerate(state.item_ids):
-        _sync_row_draft_to_workbook(
-            item_idx=int(idx),
-            item_id=int(item_id),
-            clear_commit_if_changed=bool(clear_commit_if_changed),
-        )
-
-
-def _sync_all_rows_draft_to_workbook(clear_commit_if_changed=True) -> None:
-    """Backward-compatible wrapper: sync current row only."""
-    try:
-        if 'cur_idx' not in globals() or 'cur_item_id' not in globals():
-            return
-        _sync_row_draft_to_workbook(
-            item_idx=int(cur_idx),
-            item_id=int(cur_item_id),
-            clear_commit_if_changed=True,
-        )
-    except Exception:
-        return
-
-
-def _hydrate_row_state_from_workbook(item_id: int, *, overwrite: bool = False) -> None:
-    """Load bucket/DA/comment values from the workbook into st.session_state for a given item.
-
-    Used on navigation so the UI always reflects workbook values.
-    """
-    try:
-        state = st.session_state.wb_state
-        cfg: RunConfig = st.session_state.cfg
-        if state is None or cfg is None:
-            return
-        if item_id not in state.item_ids:
-            return
-
-        idx = state.item_ids.index(item_id)
-        rr = _get_row_index(idx)
-
-        wb = state.wb
-        eval_ws = wb["eval"]
-        ec = state.eval_col
-
-        key_to_label = cfg.bucket_labels_by_key  # bucket_key -> label
-        placeholder = BUCKET_PLACEHOLDER
-
-        for pos in range(1, cfg.num_translations + 1):
-            bucket_key = f"bucket_pos_{item_id}_{pos}"
-            da_key = f"da_val_{item_id}_{pos}"
-
-            b_key = eval_ws.cell(row=rr, column=ec[f"bucket_t{pos}"]).value
-            b_label = key_to_label.get(str(b_key)) if b_key else None
-            if overwrite or bucket_key not in st.session_state:
-                st.session_state[bucket_key] = b_label if b_label else placeholder
-
-            d_val = eval_ws.cell(row=rr, column=ec[f"da_t{pos}"]).value
-            if overwrite or da_key not in st.session_state:
-                try:
-                    st.session_state[da_key] = int(d_val) if d_val is not None else int(cfg.da_min)
-                except Exception:
-                    st.session_state[da_key] = int(cfg.da_min)
-
-        c_key = f"comment_{item_id}"
-        c_val = eval_ws.cell(row=rr, column=ec["comment"]).value
-        if overwrite or c_key not in st.session_state:
-            st.session_state[c_key] = str(c_val or "")
-
-    except Exception:
-        return
+#         # next bucket must start >= (max in this bucket + gap)
+#         current_floor = min(int(cfg.da_max), int(proposed[-1]) + int(gap))
 
 
 # ---------------- Validate & Commit ----------------
@@ -589,104 +405,22 @@ def get_cur_idx():
 def _rank_for_pos(pos: int) -> Tuple[int, int, int]:
     """
     Sort key: (bucket_rank_best_first, -da, pos)
-
-    IMPORTANT: This helper must be safe to call before the main rendering code
-    defines UI-derived globals like `label_to_key`. Therefore we derive the
-    needed mappings from the loaded config each call.
+    Unselected bucket goes to bottom.
     """
-    bucket_label = st.session_state.get(f"bucket_pos_{cur_item_id}_{pos}", "Select…")
-
-    _cfg = st.session_state.get("cfg")
-    if _cfg is None:
-        # Fallback: keep stable ordering.
+    bucket_label = st.session_state.get(f"bucket_pos_{cur_item_id}_{pos}", BUCKET_PLACEHOLDER)
+    if bucket_label == BUCKET_PLACEHOLDER:
         bucket_rank = 999
     else:
-        _label_to_key = {b.label: b.key for b in _cfg.buckets}
-        _bucket_key_to_rank = {b.key: i for i, b in enumerate(_cfg.buckets)}  # best=0..poor=3
+        b_key = label_to_key.get(str(bucket_label))
+        bucket_rank = bucket_key_to_rank_best_first.get(b_key, 999)
 
-        if bucket_label == "Select…":
-            bucket_rank = 999
-        else:
-            b_key = _label_to_key.get(str(bucket_label))
-            bucket_rank = _bucket_key_to_rank.get(b_key, 999)
-
-    da_val = st.session_state.get(f"da_val_{cur_item_id}_{pos}", getattr(_cfg, "da_min", 1) if _cfg else 1)
+    da_val = st.session_state.get(f"da_val_{cur_item_id}_{pos}", cfg.da_min)
     try:
         da_i = int(da_val)
     except Exception:
-        da_i = int(getattr(_cfg, "da_min", 1) if _cfg else 1)
+        da_i = int(cfg.da_min)
 
-    return (int(bucket_rank), -int(da_i), int(pos))
-
-
-
-def _ensure_display_order(*, cfg: RunConfig, cur_item_id: int) -> List[int]:
-    """Ensure a stable display order list exists for the current sentence.
-
-    The order is stored as a list of display positions (1..num_translations).
-    """
-    order_key = _get_order_key(cur_item_id)
-    grouped_key = _get_order_grouped_key(cur_item_id)
-
-    expected = list(range(1, cfg.num_translations + 1))
-    cur = st.session_state.get(order_key)
-
-    if not isinstance(cur, list) or len(cur) != len(expected) or sorted(cur) != expected:
-        st.session_state[order_key] = expected
-        st.session_state[grouped_key] = False
-
-    return list(st.session_state[order_key])
-
-
-def _reorder_by_bucket(*, cfg: RunConfig, cur_item_id: int) -> None:
-    """Manual reorder: group best->poor, keep within-bucket stable."""
-    order_key = _get_order_key(cur_item_id)
-    grouped_key = _get_order_grouped_key(cur_item_id)
-
-    cur_order = _ensure_display_order(cfg=cfg, cur_item_id=cur_item_id)
-    idx = {p: i for i, p in enumerate(cur_order)}
-
-    def _k(p: int):
-        bucket_rank, _neg_da, _pos = _rank_for_pos(p)
-        return (bucket_rank, idx.get(p, 9999))
-
-    st.session_state[order_key] = sorted(cur_order, key=_k)
-    st.session_state[grouped_key] = True
-
-
-def _reorder_by_bucket_and_da(*, cfg: RunConfig, cur_item_id: int) -> None:
-    """Manual reorder: group best->poor, then DA desc within bucket."""
-    order_key = _get_order_key(cur_item_id)
-    grouped_key = _get_order_grouped_key(cur_item_id)
-
-    cur_order = _ensure_display_order(cfg=cfg, cur_item_id=cur_item_id)
-    st.session_state[order_key] = sorted(cur_order, key=_rank_for_pos)
-    st.session_state[grouped_key] = True
-
-
-def _maybe_auto_reorder_on_bucket_change(*, cfg: RunConfig, cur_item_id: int) -> None:
-    """Automatic reorder after a bucket change (if enabled)."""
-    if not st.session_state.get("auto_reorder_on_bucket_select", True):
-        return
-    # If DA auto-reorder is enabled, use full ranking. Otherwise keep DA-stable.
-    if st.session_state.get("auto_reorder_on_da_select", True):
-        _reorder_by_bucket_and_da(cfg=cfg, cur_item_id=cur_item_id)
-    else:
-        _reorder_by_bucket(cfg=cfg, cur_item_id=cur_item_id)
-
-
-def _maybe_auto_reorder_on_da_change(*, cfg: RunConfig, cur_item_id: int) -> None:
-    """Automatic reorder after a DA change (if enabled).
-
-    Note: DA ordering is *within bucket*, so we only auto-reorder if bucket auto-reorder
-    is enabled, or if the user has manually bucket-grouped this sentence.
-    """
-    if not st.session_state.get("auto_reorder_on_da_select", True):
-        return
-    if st.session_state.get("auto_reorder_on_bucket_select", True) or st.session_state.get(
-        _get_order_grouped_key(cur_item_id), False
-    ):
-        _reorder_by_bucket_and_da(cfg=cfg, cur_item_id=cur_item_id)
+    return (bucket_rank, -da_i, pos)
 
 # ---------------- UI: Upload / Init ----------------
 try:
@@ -696,7 +430,14 @@ except Exception as e:
     st.error(f"Config error: {e}")
     st.stop()
 
-# Bucket order (best->poor)
+# --- Derived DA ranges based on intra-bucket options (quartiles)
+# New YAML keys (recommended):
+#   da_intra_bucket_options: <int>
+#   bucket_colors:
+#     best: {bg: "#...", border: "#..."}
+#     good: {bg: "#...", border: "#..."}
+#     ok:   {bg: "#...", border: "#..."}
+#     poor: {bg: "#...", border: "#..."}
 bucket_order_best_first = [b.key for b in cfg.buckets]
 
 da_intra = getattr(cfg, "da_intra_bucket_options", None)
@@ -729,13 +470,15 @@ except Exception:
 # Default bucket colors (tinted bg + strong border)
 default_bucket_colors = {
     "best": {"bg": "#E9F7EF", "border": "#1E8E3E"},   # green
-    "good": {"bg": "#FFF4E5", "border": "#1A73E8"},   # orange
-    "ok":   {"bg": "#E8F1FF", "border": "#FB8C00"},   # blue
+    "good": {"bg": "#FFF4E5", "border": "#FB8C00"},   # orange
+    "ok":   {"bg": "#E8F1FF", "border": "#1A73E8"},   # blue
     "poor": {"bg": "#FDECEC", "border": "#D93025"},   # red
 }
 bucket_colors = getattr(cfg, "bucket_colors", None) or default_bucket_colors
 
 # Global CSS for bucket highlighting.
+# IMPORTANT: Only change border color (no background tint), and scope selectors tightly
+# so we don't accidentally style large parent blocks.
 st.markdown(
     """
 <style>
@@ -858,31 +601,7 @@ with st.expander("Important Instructions. Please Read First. (Click here to show
         instructions_md
     )
 
-# ---------------- Sidebar controls ----------------
-st.sidebar.markdown("### Load Dataset")
-uploaded = st.sidebar.file_uploader(
-    "Upload evaluation XLSX",
-    type=["xlsx"],
-    accept_multiple_files=False,
-)
-
-# ----- Auto-reorder controls ------
-st.sidebar.markdown("")  # spacer
-st.sidebar.markdown("")
-st.sidebar.markdown("### Auto-reordering:")
-st.session_state.setdefault("auto_reorder_on_bucket_select", True)
-st.session_state.setdefault("auto_reorder_on_da_select", True)
-
-st.sidebar.toggle(
-    "On bucket selection",
-    key="auto_reorder_on_bucket_select",
-    help="If enabled, selecting/changing bucket assignment will automatically reorder translations into groups; Best to Poor.",
-)
-st.sidebar.toggle(
-    "On DA selection",
-    key="auto_reorder_on_da_select",
-    help="If enabled, DA changes will re-order by bucket and DA values within their buckets (irrespective of 'On bucket selection' toggle).",
-)
+uploaded = st.file_uploader("Upload evaluation XLSX", type=["xlsx"], accept_multiple_files=False)
 
 if uploaded is None and st.session_state.wb_state is None:
     st.info("Please Upload the researcher-provided Excel .xslx file to begin or resume.")
@@ -934,37 +653,8 @@ cur_idx = get_cur_idx()
 r = _get_row_index(cur_idx)
 cur_item_id = state.item_ids[cur_idx]
 
-# If navigation requested a refresh of this row's widget state, hydrate from workbook.
-if st.session_state.get('pending_hydrate_item_id') is not None:
-    _pid = int(st.session_state.get('pending_hydrate_item_id'))
-    if _pid == int(cur_item_id):
-        _hydrate_row_state_from_workbook(int(cur_item_id), overwrite=True)
-        st.session_state.pop('pending_hydrate_item_id', None)
-
-
-# Sidebar: manual reordering controls (also mirrored in main UI below)
-st.sidebar.markdown("")  # spacer
-st.sidebar.markdown("")  # spacer
-st.sidebar.markdown("### Manual reordering:")
-sb_cols = st.sidebar.columns(2)
-with sb_cols[0]:
-    if st.sidebar.button("Reorder buckets", use_container_width=True):
-        _reorder_by_bucket(cfg=cfg, cur_item_id=cur_item_id)
-with sb_cols[1]:
-    if st.sidebar.button("Reorder buckets & DA", use_container_width=True):
-        _reorder_by_bucket_and_da(cfg=cfg, cur_item_id=cur_item_id)
-
 if "jump_to_sentence_pending" in st.session_state:
-    _j = int(st.session_state.pop("jump_to_sentence_pending"))
-    st.session_state["jump_to_sentence"] = _j
-    # Jump-to changes the current sentence; ensure we hydrate widgets from workbook on arrival.
-    try:
-        _new_idx = max(0, min(int(_j) - 1, len(state.item_ids) - 1))
-        st.session_state.current_item_idx = _new_idx
-        st.session_state["pending_hydrate_item_id"] = int(state.item_ids[_new_idx])
-    except Exception:
-        pass
-
+    st.session_state["jump_to_sentence"] = int(st.session_state.pop("jump_to_sentence_pending"))
 
 # Initialize jump box once (do not overwrite user edits)
 if "jump_to_sentence" not in st.session_state or st.session_state.get("jump_to_sentence") is None:
@@ -1043,6 +733,7 @@ bucket_labels = [b.label for b in cfg.buckets]
 label_to_key = {b.label: b.key for b in cfg.buckets}
 key_to_label = {b.key: b.label for b in cfg.buckets}
 
+BUCKET_PLACEHOLDER = "Select…"
 bucket_options = [BUCKET_PLACEHOLDER] + bucket_labels
 assert len(bucket_options) > 1, "No bucket labels loaded from config"
 
@@ -1079,25 +770,9 @@ for pos, tcol, t_idx, text, existing_bucket_key, existing_da in pos_to_current:
     if da_model_key not in st.session_state:
         st.session_state[da_model_key] = int(existing_da) if existing_da is not None else int(cfg.da_min)
 
-# Determine display order (stable unless auto/manual re-ordered)
+# Determine display order (always grouped best->poor, then DA desc)
 positions = [pos for (pos, *_rest) in pos_to_current]
-order_key = _get_order_key(cur_item_id)
-
-# First time we open this sentence in this session: initialize display order.
-# Defaults match prior behavior (group by bucket; optionally sort by DA),
-# but subsequent reruns will keep the stored order unless auto/manual reorder happens.
-if order_key not in st.session_state:
-    st.session_state[order_key] = list(range(1, cfg.num_translations + 1))
-    st.session_state[_get_order_grouped_key(cur_item_id)] = False
-    if st.session_state.get("auto_reorder_on_bucket_select", True):
-        if st.session_state.get("auto_reorder_on_da_select", True):
-            _reorder_by_bucket_and_da(cfg=cfg, cur_item_id=cur_item_id)
-        else:
-            _reorder_by_bucket(cfg=cfg, cur_item_id=cur_item_id)
-else:
-    _ensure_display_order(cfg=cfg, cur_item_id=cur_item_id)
-
-positions = list(st.session_state[order_key])
+positions = sorted(positions, key=_rank_for_pos)
 
 # Render per translation (in sorted order)
 for pos in positions:
@@ -1187,9 +862,6 @@ for pos in positions:
                 st.session_state[prev_key_state] = new_bucket_key
                 st.session_state[epoch_key] = int(st.session_state.get(epoch_key, 0)) + 1
 
-                # Optional auto-reorder (configurable)
-                _maybe_auto_reorder_on_bucket_change(cfg=cfg, cur_item_id=cur_item_id)
-
             st.radio(
                 f"Bucket {pos}",
                 options=bucket_options,
@@ -1232,9 +904,6 @@ for pos in positions:
                     st.session_state[_mkey] = int(st.session_state[_skey])
                 except Exception:
                     pass
-
-                # Optional auto-reorder (configurable)
-                _maybe_auto_reorder_on_da_change(cfg=cfg, cur_item_id=cur_item_id)
             
             st.write("Enter the direct assessment score for this translation (Note: Range changes based on quartile):")
             st.slider(
@@ -1251,8 +920,6 @@ for pos in positions:
             )
 
 
-# Manual reorder controls removed (use sidebar buttons)
-
 st.markdown("### Comment (optional)")
 comment = st.text_area("Comment", value=str(comment_val), key=f"comment_{cur_item_id}", label_visibility="collapsed")
 
@@ -1268,15 +935,12 @@ ctrl = st.columns([1, 1, 1, 4])
 with ctrl[0]:
     back_disabled = (cur_idx == 0)
     if cfg.ui_show_back and st.button("Back", disabled=back_disabled, use_container_width=True):
-        _sync_current_row_draft_to_workbook()
         st.session_state.current_item_idx = max(0, cur_idx - 1)
-        st.session_state["pending_hydrate_item_id"] = int(state.item_ids[st.session_state.current_item_idx])
         _set_jump_to_sentence(int(st.session_state.current_item_idx) + 1)
         st.rerun()
 
 with ctrl[1]:
     if st.button("Save (checkpoint)", use_container_width=True):
-        _sync_all_rows_draft_to_workbook(clear_commit_if_changed=True)
         st.success("Checkpoint ready — use Download checkpoint.")
         _recompute_global_status()
 
@@ -1296,9 +960,8 @@ with ctrl[2]:
             _write_eval_row(bucket_by_t, da_by_t)
             _recompute_global_status()
             st.session_state.current_item_idx = min(cur_idx + 1, N_items - 1)
-        st.session_state["pending_hydrate_item_id"] = int(state.item_ids[st.session_state.current_item_idx])
-        _set_jump_to_sentence(int(st.session_state.current_item_idx) + 1)
-        st.rerun()
+            _set_jump_to_sentence(int(st.session_state.current_item_idx) + 1)
+            st.rerun()
 
 # ---------------- Finish / Summary ----------------
 all_complete = (len(st.session_state.incomplete_item_ids) == 0)
@@ -1315,13 +978,6 @@ with finish_cols[1]:
         st.session_state["show_summary"] = True
 
 if cfg.ui_show_completion_summary and st.session_state.get("show_summary") and all_complete and no_invalid:
-    st.info(
-            "PLEASE DOWNLOAD THE CHECKPOINT NOW. This is the only way to save your work!  \n\n"
-            "Download the final XLSX and send it to the research team.  \n"
-            "Reminder: The analysis is not complete until all you download the checkpoint .xslx file and send it to the research team.  \n"
-            "**The final .xlsx WILL NOT be available after you leave this screen, and all evaluations will be lost.**  \n\n"
-            "See the total information below. No per-system statistics are shown."
-            )
     st.markdown("## Completion summary (blind, aggregate only)")
 
     # Aggregate DA stats across all translations / all rows
@@ -1353,6 +1009,14 @@ if cfg.ui_show_completion_summary and st.session_state.get("show_summary") and a
 
     da_stats = aggregate_da_stats(all_scores)
     time_stats = summarize_times(times)
+
+    st.info(
+            "PLEASE DOWNLOAD THE CHECKPOINT NOW. This is the only way to save your work!  \n\n"
+            "Download the final XLSX and send it to the research team.  \n"
+            "Reminder: The analysis is not complete until all you download the checkpoint .xslx file and send it to the research team.  \n"
+            "**The final .xlsx WILL NOT be available after you leave this screen, and all evaluations will be lost.**  \n\n"
+            "See the total information below. No per-system statistics are shown."
+            )
 
     st.markdown("### DA statistics (all translations pooled)")
     st.json(da_stats)

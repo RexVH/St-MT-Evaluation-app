@@ -113,6 +113,7 @@ Click **Next** when you are done with the current sentence.
 - Do not try to track or guess systems by position. Rate what you see.
 - The provided .xlsx file has built-in integrity checks which verifies that the .xlsx file is internally consistent.  
   If you see an integrity error, **stop and contact the research team**.
+
 ---
 
 ## 7) Finishing
@@ -121,6 +122,7 @@ The 'Finish' button is only enabled when **all sentences are complete and valid*
 When you click **Finish**, the app shows a blind, aggregate completion summary.  
 **You must download the final checkpoint XLSX and send it to the research team.**
 **Your evaluation is not complete until you download the final .xlsx file and send it to the research team.**
+
 ---
 
 ## 8) If something looks wrong

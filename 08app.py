@@ -41,7 +41,7 @@ def ss_init():
 ss_init()
 
 
-# Global UI placeholder (used by ordering + draft sync)
+# Global UI placeholder (must be defined early; used by ordering helpers)
 BUCKET_PLACEHOLDER = "Select…"
 
 def _ss_key(*parts: object) -> str:
@@ -138,70 +138,6 @@ def _get_row_index(item_idx: int) -> int:
     return 2 + item_idx
 
 
-def _sync_current_row_draft_to_workbook() -> None:
-    """Write *draft* UI state for the current sentence into the workbook.
-
-    This is intentionally NOT a commit:
-    - does NOT set committed_at
-    - does NOT set row_eval_hash
-
-    It only exists so that navigation (Back/Jump) and checkpoint downloads can
-    preserve in-progress work on the current sentence.
-    """
-    state = st.session_state.get("wb_state")
-    cfg: RunConfig = st.session_state.get("cfg")
-    if state is None or cfg is None:
-        return
-
-    cur_idx = int(st.session_state.get("current_item_idx", 0))
-    if cur_idx < 0 or cur_idx >= len(state.item_ids):
-        return
-    cur_item_id = int(state.item_ids[cur_idx])
-
-    # Only sync if the user has touched something for this sentence.
-    touched = False
-    for pos in range(1, cfg.num_translations + 1):
-        if f"bucket_pos_{cur_item_id}_{pos}" in st.session_state or f"da_val_{cur_item_id}_{pos}" in st.session_state:
-            touched = True
-            break
-    if (not touched) and (f"comment_{cur_item_id}" not in st.session_state):
-        return
-
-    eval_ws = state.wb[state.eval_ws_name]
-    ec = state.eval_col
-    rr = _get_row_index(cur_idx)
-
-    dm_json = str(eval_ws.cell(row=rr, column=ec["display_map_json"]).value or "")
-    if not dm_json:
-        return
-    dm = parse_display_map(dm_json, cfg.num_translations)  # pos -> "t7"
-
-    label_to_key = {b.label: b.key for b in cfg.buckets}
-
-    for pos in range(1, cfg.num_translations + 1):
-        tcol = dm[pos]
-        t_idx = int(tcol[1:])
-
-        # Bucket: UI stores label; workbook stores key
-        b_label = st.session_state.get(f"bucket_pos_{cur_item_id}_{pos}", BUCKET_PLACEHOLDER)
-        b_key = ""
-        if b_label and str(b_label) != BUCKET_PLACEHOLDER:
-            b_key = label_to_key.get(str(b_label), "") or ""
-        eval_ws.cell(row=rr, column=ec[f"bucket_t{t_idx}"]).value = str(b_key)
-
-        # DA
-        d_val = st.session_state.get(f"da_val_{cur_item_id}_{pos}")
-        try:
-            d_int = int(d_val) if d_val is not None else None
-        except Exception:
-            d_int = None
-        eval_ws.cell(row=rr, column=ec[f"da_t{t_idx}"]).value = d_int
-
-    # Comment
-    if f"comment_{cur_item_id}" in st.session_state:
-        eval_ws.cell(row=rr, column=ec["comment"]).value = str(st.session_state.get(f"comment_{cur_item_id}") or "")
-
-
 def _set_jump_to_sentence(n: int) -> None:
     """
     Defer updating the jump-to widget value until the *next* rerun.
@@ -268,15 +204,11 @@ def _recompute_global_status():
 
 
 def _jump_to_item_id(target_item_id: int):
-    # Preserve any uncommitted work on the current sentence before navigating.
-    _sync_current_row_draft_to_workbook()
-
     state = st.session_state.wb_state
     if target_item_id not in state.item_ids:
         return
     new_idx = state.item_ids.index(target_item_id)
     st.session_state.current_item_idx = new_idx
-    st.session_state["pending_hydrate_item_id"] = int(target_item_id)
     _set_jump_to_sentence(int(new_idx + 1))
 
 
@@ -319,9 +251,56 @@ def _render_banner():
         st.success("✅ All sentences complete and valid. You can Finish and download the final XLSX.", icon="✅")
 
 
+
+
+def _sync_current_row_draft_to_workbook(*, cfg: RunConfig, state, cur_idx: int, cur_item_id: int) -> None:
+    """Persist the CURRENT sentence's in-progress UI selections into the workbook for checkpoints.
+
+    This does NOT change commit semantics (committed_at / row_eval_hash).
+    It only ensures that a downloaded checkpoint includes what the rater has entered so far
+    on the current sentence, even if they haven't clicked Next yet.
+    """
+    try:
+        rr = _get_row_index(int(cur_idx))
+        eval_ws = state.wb[state.eval_ws_name]
+        ec = state.eval_col
+
+        dm_json = str(eval_ws.cell(row=rr, column=ec["display_map_json"]).value or "")
+        if not dm_json:
+            return
+        dm = parse_display_map(dm_json, cfg.num_translations)  # pos -> "t#"
+
+        label_to_key_local = {b.label: b.key for b in cfg.buckets}
+        placeholder = BUCKET_PLACEHOLDER
+
+        for pos in range(1, cfg.num_translations + 1):
+            tcol = dm[pos]
+            t_idx = int(tcol[1:])
+
+            b_label = st.session_state.get(f"bucket_pos_{cur_item_id}_{pos}", placeholder)
+            b_key = ""
+            if b_label and str(b_label) != placeholder:
+                b_key = label_to_key_local.get(str(b_label), "") or ""
+            eval_ws.cell(row=rr, column=ec[f"bucket_t{t_idx}"]).value = str(b_key)
+
+            d_val = st.session_state.get(f"da_val_{cur_item_id}_{pos}")
+            try:
+                d_int = int(d_val) if d_val is not None else None
+            except Exception:
+                d_int = None
+            eval_ws.cell(row=rr, column=ec[f"da_t{t_idx}"]).value = d_int
+
+        c = st.session_state.get(f"comment_{cur_item_id}")
+        if c is not None:
+            eval_ws.cell(row=rr, column=ec["comment"]).value = str(c or "")
+    except Exception:
+        # Checkpoint sync should never crash the app.
+        return
+
 def _download_button(label: str):
-    _sync_all_rows_draft_to_workbook(clear_commit_if_changed=True)
     state = st.session_state.wb_state
+    # Ensure current sentence drafts are included in the checkpoint download
+    _sync_current_row_draft_to_workbook(cfg=st.session_state.cfg, state=state, cur_idx=cur_idx, cur_item_id=cur_item_id)
     data = save_workbook_to_bytes(state)
     fname = st.session_state.upload_name or "mt_eval_checkpoint.xlsx"
     st.download_button(
@@ -331,190 +310,6 @@ def _download_button(label: str):
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
-
-
-
-
-def _sync_row_draft_to_workbook(
-    *,
-    item_idx: int,
-    item_id: int,
-    clear_commit_if_changed: bool,
-) -> None:
-    """Persist UI selections for a specific sentence into the workbook.
-
-    This writes *whatever the rater currently has in session_state* (bucket/DA/comment)
-    into the XLSX so that checkpoints truly capture the current work-in-progress.
-
-    If `clear_commit_if_changed` is True and the row was previously committed, we clear
-    committed_at + row_eval_hash when we detect any change. This keeps semantics sane:
-    edits are saved in the checkpoint, but the row is no longer considered 'committed'
-    until the rater clicks Next again.
-    """
-    state = st.session_state.wb_state
-    cfg: RunConfig = st.session_state.cfg
-    if state is None or cfg is None:
-        return
-
-    rr = _get_row_index(int(item_idx))
-    _eval_ws = state.wb[state.eval_ws_name]
-    _ec = state.eval_col
-
-    # Only sync rows the user has actually touched in this session.
-    # (Otherwise we'd overwrite workbook values with placeholders.)
-    touched = False
-    for pos in range(1, cfg.num_translations + 1):
-        if f"bucket_pos_{item_id}_{pos}" in st.session_state:
-            touched = True
-            break
-        if f"da_val_{item_id}_{pos}" in st.session_state:
-            touched = True
-            break
-    if (not touched) and (f"comment_{item_id}" not in st.session_state):
-        return
-
-    committed_before = _eval_ws.cell(row=rr, column=_ec["committed_at"]).value
-
-    # Need display_map to map display pos -> canonical t#
-    dm_json = str(_eval_ws.cell(row=rr, column=_ec["display_map_json"]).value or "")
-    if not dm_json:
-        return
-    dm = parse_display_map(dm_json, cfg.num_translations)
-
-    # Label->key mapping (label is stored in UI; key is stored in XLSX)
-    _label_to_key = {b.label: b.key for b in cfg.buckets}
-    placeholder = BUCKET_PLACEHOLDER
-
-    changed = False
-
-    for pos in range(1, cfg.num_translations + 1):
-        tcol = dm[pos]          # e.g. "t7"
-        t_idx = int(tcol[1:])   # 7
-
-        # Bucket (UI stores label; XLSX stores key)
-        b_label = st.session_state.get(f"bucket_pos_{item_id}_{pos}", placeholder)
-        b_key = ""
-        if b_label and str(b_label) != placeholder:
-            b_key = _label_to_key.get(str(b_label), "") or ""
-
-        cell_bucket = str(_eval_ws.cell(row=rr, column=_ec[f"bucket_t{t_idx}"]).value or "")
-        if cell_bucket != str(b_key):
-            changed = True
-            _eval_ws.cell(row=rr, column=_ec[f"bucket_t{t_idx}"]).value = str(b_key)
-
-        # DA
-        d_val = st.session_state.get(f"da_val_{item_id}_{pos}")
-        try:
-            d_int = int(d_val) if d_val is not None else None
-        except Exception:
-            d_int = None
-
-        cell_da = _eval_ws.cell(row=rr, column=_ec[f"da_t{t_idx}"]).value
-        try:
-            cell_da_int = int(cell_da) if cell_da is not None and str(cell_da).strip() != "" else None
-        except Exception:
-            cell_da_int = None
-
-        if cell_da_int != d_int:
-            changed = True
-            _eval_ws.cell(row=rr, column=_ec[f"da_t{t_idx}"]).value = d_int
-
-    # Comment (draft)
-    c = st.session_state.get(f"comment_{item_id}", None)
-    if c is not None:
-        c_str = str(c or "")
-        cell_c = str(_eval_ws.cell(row=rr, column=_ec["comment"]).value or "")
-        if cell_c != c_str:
-            changed = True
-            _eval_ws.cell(row=rr, column=_ec["comment"]).value = c_str
-
-    if clear_commit_if_changed and committed_before and changed:
-        # Preserve started_at, edit_count, etc. but mark "needs re-commit".
-        _eval_ws.cell(row=rr, column=_ec["committed_at"]).value = ""
-        _eval_ws.cell(row=rr, column=_ec["row_eval_hash"]).value = ""
-
-
-def _sync_all_rows_draft_to_workbook(*, clear_commit_if_changed: bool = True) -> None:
-    """Sync all rows the user has touched this session into the workbook.
-
-    This makes 'Save (checkpoint)' and 'Download checkpoint' behave like users expect:
-    the checkpoint XLSX reflects *everything you've entered/edited so far*, even if you
-    navigated back to earlier sentences and haven't clicked Next again.
-    """
-    state = st.session_state.wb_state
-    cfg: RunConfig = st.session_state.cfg
-    if state is None or cfg is None:
-        return
-
-    for idx, item_id in enumerate(state.item_ids):
-        _sync_row_draft_to_workbook(
-            item_idx=int(idx),
-            item_id=int(item_id),
-            clear_commit_if_changed=bool(clear_commit_if_changed),
-        )
-
-
-def _sync_all_rows_draft_to_workbook(clear_commit_if_changed=True) -> None:
-    """Backward-compatible wrapper: sync current row only."""
-    try:
-        if 'cur_idx' not in globals() or 'cur_item_id' not in globals():
-            return
-        _sync_row_draft_to_workbook(
-            item_idx=int(cur_idx),
-            item_id=int(cur_item_id),
-            clear_commit_if_changed=True,
-        )
-    except Exception:
-        return
-
-
-def _hydrate_row_state_from_workbook(item_id: int, *, overwrite: bool = False) -> None:
-    """Load bucket/DA/comment values from the workbook into st.session_state for a given item.
-
-    Used on navigation so the UI always reflects workbook values.
-    """
-    try:
-        state = st.session_state.wb_state
-        cfg: RunConfig = st.session_state.cfg
-        if state is None or cfg is None:
-            return
-        if item_id not in state.item_ids:
-            return
-
-        idx = state.item_ids.index(item_id)
-        rr = _get_row_index(idx)
-
-        wb = state.wb
-        eval_ws = wb["eval"]
-        ec = state.eval_col
-
-        key_to_label = cfg.bucket_labels_by_key  # bucket_key -> label
-        placeholder = BUCKET_PLACEHOLDER
-
-        for pos in range(1, cfg.num_translations + 1):
-            bucket_key = f"bucket_pos_{item_id}_{pos}"
-            da_key = f"da_val_{item_id}_{pos}"
-
-            b_key = eval_ws.cell(row=rr, column=ec[f"bucket_t{pos}"]).value
-            b_label = key_to_label.get(str(b_key)) if b_key else None
-            if overwrite or bucket_key not in st.session_state:
-                st.session_state[bucket_key] = b_label if b_label else placeholder
-
-            d_val = eval_ws.cell(row=rr, column=ec[f"da_t{pos}"]).value
-            if overwrite or da_key not in st.session_state:
-                try:
-                    st.session_state[da_key] = int(d_val) if d_val is not None else int(cfg.da_min)
-                except Exception:
-                    st.session_state[da_key] = int(cfg.da_min)
-
-        c_key = f"comment_{item_id}"
-        c_val = eval_ws.cell(row=rr, column=ec["comment"]).value
-        if overwrite or c_key not in st.session_state:
-            st.session_state[c_key] = str(c_val or "")
-
-    except Exception:
-        return
-
 
 # ---------------- Validate & Commit ----------------
 def _collect_current_inputs() -> Tuple[Dict[str, Optional[str]], Dict[str, Optional[int]]]:
@@ -696,7 +491,7 @@ except Exception as e:
     st.error(f"Config error: {e}")
     st.stop()
 
-# Bucket order (best->poor)
+# Bucket order best->poor
 bucket_order_best_first = [b.key for b in cfg.buckets]
 
 da_intra = getattr(cfg, "da_intra_bucket_options", None)
@@ -729,13 +524,15 @@ except Exception:
 # Default bucket colors (tinted bg + strong border)
 default_bucket_colors = {
     "best": {"bg": "#E9F7EF", "border": "#1E8E3E"},   # green
-    "good": {"bg": "#FFF4E5", "border": "#1A73E8"},   # orange
-    "ok":   {"bg": "#E8F1FF", "border": "#FB8C00"},   # blue
+    "good": {"bg": "#FFF4E5", "border": "#FB8C00"},   # orange
+    "ok":   {"bg": "#E8F1FF", "border": "#1A73E8"},   # blue
     "poor": {"bg": "#FDECEC", "border": "#D93025"},   # red
 }
 bucket_colors = getattr(cfg, "bucket_colors", None) or default_bucket_colors
 
 # Global CSS for bucket highlighting.
+# IMPORTANT: Only change border color (no background tint), and scope selectors tightly
+# so we don't accidentally style large parent blocks.
 st.markdown(
     """
 <style>
@@ -858,30 +655,30 @@ with st.expander("Important Instructions. Please Read First. (Click here to show
         instructions_md
     )
 
+
 # ---------------- Sidebar controls ----------------
-st.sidebar.markdown("### Load Dataset")
+st.sidebar.markdown("### Dataset")
 uploaded = st.sidebar.file_uploader(
     "Upload evaluation XLSX",
     type=["xlsx"],
     accept_multiple_files=False,
 )
 
-# ----- Auto-reorder controls ------
-st.sidebar.markdown("")  # spacer
-st.sidebar.markdown("")
-st.sidebar.markdown("### Auto-reordering:")
+st.sidebar.markdown("")     # small spacer
+st.sidebar.markdown("")     # add'l small spacer
+st.sidebar.markdown("### Auto-Reordering:")
 st.session_state.setdefault("auto_reorder_on_bucket_select", True)
 st.session_state.setdefault("auto_reorder_on_da_select", True)
 
 st.sidebar.toggle(
     "On bucket selection",
     key="auto_reorder_on_bucket_select",
-    help="If enabled, selecting/changing bucket assignment will automatically reorder translations into groups; Best to Poor.",
+    help="If enabled, selecting/changing a bucket will re-order translations among their buckets, Best-to-Poor.",
 )
 st.sidebar.toggle(
     "On DA selection",
     key="auto_reorder_on_da_select",
-    help="If enabled, DA changes will re-order by bucket and DA values within their buckets (irrespective of 'On bucket selection' toggle).",
+    help="If enabled, DA changes will re-order buckets and translations within their bucket (irrespective of the 'On bucket selection' toggle value).",
 )
 
 if uploaded is None and st.session_state.wb_state is None:
@@ -934,37 +731,20 @@ cur_idx = get_cur_idx()
 r = _get_row_index(cur_idx)
 cur_item_id = state.item_ids[cur_idx]
 
-# If navigation requested a refresh of this row's widget state, hydrate from workbook.
-if st.session_state.get('pending_hydrate_item_id') is not None:
-    _pid = int(st.session_state.get('pending_hydrate_item_id'))
-    if _pid == int(cur_item_id):
-        _hydrate_row_state_from_workbook(int(cur_item_id), overwrite=True)
-        st.session_state.pop('pending_hydrate_item_id', None)
-
-
 # Sidebar: manual reordering controls (also mirrored in main UI below)
-st.sidebar.markdown("")  # spacer
-st.sidebar.markdown("")  # spacer
+st.sidebar.markdown("")     # small spacer
+st.sidebar.markdown("")     # add'l small spacer
 st.sidebar.markdown("### Manual reordering:")
 sb_cols = st.sidebar.columns(2)
 with sb_cols[0]:
-    if st.sidebar.button("Reorder buckets", use_container_width=True):
+    if st.sidebar.button("Reorder: buckets", use_container_width=True):
         _reorder_by_bucket(cfg=cfg, cur_item_id=cur_item_id)
 with sb_cols[1]:
-    if st.sidebar.button("Reorder buckets & DA", use_container_width=True):
+    if st.sidebar.button("Reorder: buckets + DA", use_container_width=True):
         _reorder_by_bucket_and_da(cfg=cfg, cur_item_id=cur_item_id)
 
 if "jump_to_sentence_pending" in st.session_state:
-    _j = int(st.session_state.pop("jump_to_sentence_pending"))
-    st.session_state["jump_to_sentence"] = _j
-    # Jump-to changes the current sentence; ensure we hydrate widgets from workbook on arrival.
-    try:
-        _new_idx = max(0, min(int(_j) - 1, len(state.item_ids) - 1))
-        st.session_state.current_item_idx = _new_idx
-        st.session_state["pending_hydrate_item_id"] = int(state.item_ids[_new_idx])
-    except Exception:
-        pass
-
+    st.session_state["jump_to_sentence"] = int(st.session_state.pop("jump_to_sentence_pending"))
 
 # Initialize jump box once (do not overwrite user edits)
 if "jump_to_sentence" not in st.session_state or st.session_state.get("jump_to_sentence") is None:
@@ -1043,6 +823,7 @@ bucket_labels = [b.label for b in cfg.buckets]
 label_to_key = {b.label: b.key for b in cfg.buckets}
 key_to_label = {b.key: b.label for b in cfg.buckets}
 
+BUCKET_PLACEHOLDER = "Select…"
 bucket_options = [BUCKET_PLACEHOLDER] + bucket_labels
 assert len(bucket_options) > 1, "No bucket labels loaded from config"
 
@@ -1268,15 +1049,13 @@ ctrl = st.columns([1, 1, 1, 4])
 with ctrl[0]:
     back_disabled = (cur_idx == 0)
     if cfg.ui_show_back and st.button("Back", disabled=back_disabled, use_container_width=True):
-        _sync_current_row_draft_to_workbook()
         st.session_state.current_item_idx = max(0, cur_idx - 1)
-        st.session_state["pending_hydrate_item_id"] = int(state.item_ids[st.session_state.current_item_idx])
         _set_jump_to_sentence(int(st.session_state.current_item_idx) + 1)
         st.rerun()
 
 with ctrl[1]:
     if st.button("Save (checkpoint)", use_container_width=True):
-        _sync_all_rows_draft_to_workbook(clear_commit_if_changed=True)
+        _sync_current_row_draft_to_workbook(cfg=cfg, state=state, cur_idx=cur_idx, cur_item_id=cur_item_id)
         st.success("Checkpoint ready — use Download checkpoint.")
         _recompute_global_status()
 
@@ -1296,9 +1075,8 @@ with ctrl[2]:
             _write_eval_row(bucket_by_t, da_by_t)
             _recompute_global_status()
             st.session_state.current_item_idx = min(cur_idx + 1, N_items - 1)
-        st.session_state["pending_hydrate_item_id"] = int(state.item_ids[st.session_state.current_item_idx])
-        _set_jump_to_sentence(int(st.session_state.current_item_idx) + 1)
-        st.rerun()
+            _set_jump_to_sentence(int(st.session_state.current_item_idx) + 1)
+            st.rerun()
 
 # ---------------- Finish / Summary ----------------
 all_complete = (len(st.session_state.incomplete_item_ids) == 0)
@@ -1315,13 +1093,6 @@ with finish_cols[1]:
         st.session_state["show_summary"] = True
 
 if cfg.ui_show_completion_summary and st.session_state.get("show_summary") and all_complete and no_invalid:
-    st.info(
-            "PLEASE DOWNLOAD THE CHECKPOINT NOW. This is the only way to save your work!  \n\n"
-            "Download the final XLSX and send it to the research team.  \n"
-            "Reminder: The analysis is not complete until all you download the checkpoint .xslx file and send it to the research team.  \n"
-            "**The final .xlsx WILL NOT be available after you leave this screen, and all evaluations will be lost.**  \n\n"
-            "See the total information below. No per-system statistics are shown."
-            )
     st.markdown("## Completion summary (blind, aggregate only)")
 
     # Aggregate DA stats across all translations / all rows
@@ -1353,6 +1124,14 @@ if cfg.ui_show_completion_summary and st.session_state.get("show_summary") and a
 
     da_stats = aggregate_da_stats(all_scores)
     time_stats = summarize_times(times)
+
+    st.info(
+            "PLEASE DOWNLOAD THE CHECKPOINT NOW. This is the only way to save your work!  \n\n"
+            "Download the final XLSX and send it to the research team.  \n"
+            "Reminder: The analysis is not complete until all you download the checkpoint .xslx file and send it to the research team.  \n"
+            "**The final .xlsx WILL NOT be available after you leave this screen, and all evaluations will be lost.**  \n\n"
+            "See the total information below. No per-system statistics are shown."
+            )
 
     st.markdown("### DA statistics (all translations pooled)")
     st.json(da_stats)
