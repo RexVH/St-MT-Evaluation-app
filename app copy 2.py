@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-import datetime as dt
+import json, datetime as dt
 import re
 import hashlib
+from io import BytesIO
 from typing import Dict, List, Optional, Tuple
+
 import streamlit as st
 
 from mt_eval.config import load_config, RunConfig
@@ -62,6 +64,11 @@ def _get_order_grouped_key(item_id: int) -> str:
 # ---------------- Helpers ----------------
 def gts():
     return dt.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+
+
+def _write_da_from_widget(widget_key: str, model_key: str):
+    st.session_state[model_key] = int(st.session_state[widget_key])
+
 
 def _bucket_range_for_key(*, bucket_key: str, intra: int, bucket_order_best_first: List[str]) -> Tuple[int, int]:
     """Return allowed DA (min,max) for a bucket.
@@ -240,8 +247,9 @@ def _recompute_global_status():
     state = st.session_state.wb_state
     cfg: RunConfig = st.session_state.cfg
     wb = state.wb
+    inputs_ws = wb["inputs"]
     eval_ws = wb["eval"]
-    #ic = state.inputs_col
+    ic = state.inputs_col
     ec = state.eval_col
 
     invalid: List[int] = []
@@ -642,6 +650,10 @@ def _write_eval_row(
         run_id=state.run_id,
     )
     _eval_ws.cell(row=rr, column=_ec["row_eval_hash"]).value = row_eval_hash
+
+
+def _current_committed_at() -> Optional[str]:
+    return eval_ws.cell(row=r, column=ec["committed_at"]).value
 
 
 def get_cur_idx():
@@ -1176,14 +1188,12 @@ else:
 positions = list(st.session_state[order_key])
 
 # Render per translation (in sorted order)
-pos_to_tuple = {t[0]: t for t in pos_to_current} # make a dict for easy lookup
 for pos in positions:
     # Look up original tuple by pos
-    # for tup in pos_to_current:
-    #     if tup[0] == pos:
-    #         _, tcol, t_idx, text, existing_bucket_key, existing_da = tup
-    #         break
-    _, tcol, t_idx, text, existing_bucket_key, existing_da = pos_to_tuple[pos]
+    for tup in pos_to_current:
+        if tup[0] == pos:
+            _, tcol, t_idx, text, existing_bucket_key, existing_da = tup
+            break
 
     # Determine current bucket key (for styling + slider range)
     bucket_label_current = st.session_state.get(f"bucket_pos_{cur_item_id}_{pos}", BUCKET_PLACEHOLDER)

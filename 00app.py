@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import datetime as dt
-import re
+import json, datetime as dt
 import hashlib
+from io import BytesIO
 from typing import Dict, List, Optional, Tuple
+
 import streamlit as st
 
 from mt_eval.config import load_config, RunConfig
@@ -36,9 +37,6 @@ def ss_init():
     st.session_state.setdefault("upload_digest", None)
     # Jump-to sentence number widget state
     st.session_state.setdefault("jump_to_sentence", 1)
-    # Finish/Completion persistence flags
-    st.session_state.setdefault("show_summary", False)
-    st.session_state.setdefault("final_notice", False)
 
 ss_init()
 
@@ -62,6 +60,11 @@ def _get_order_grouped_key(item_id: int) -> str:
 # ---------------- Helpers ----------------
 def gts():
     return dt.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+
+
+def _write_da_from_widget(widget_key: str, model_key: str):
+    st.session_state[model_key] = int(st.session_state[widget_key])
+
 
 def _bucket_range_for_key(*, bucket_key: str, intra: int, bucket_order_best_first: List[str]) -> Tuple[int, int]:
     """Return allowed DA (min,max) for a bucket.
@@ -110,49 +113,24 @@ def _remap_da_between_buckets(*, old_da: int, old_range: Tuple[int, int], new_ra
     return max(int(n_min), min(int(n_max), int(mapped)))
 
 
-def _soft_validate_live(cfg, bucket_by_t, da_by_t, t_meta: Optional[Dict[str, Tuple[int, str]]] = None):
+def _soft_validate_live(cfg, bucket_by_t, da_by_t):
     """
     Live checks: bucket selected + DA in range.
     Do NOT enforce bucket ordering during live editing.
-
-    t_meta maps canonical t-col (e.g., "t10") -> (display_pos, translation_text)
-    so we can show user-friendly, non-leaky messages.
     """
-    reasons: List[str] = []
-
-    def _fmt(t: str) -> str:
-        if t_meta and t in t_meta:
-            pos, text = t_meta[t]
-            return f"{pos}) {text}"
-        return str(t)
-
+    reasons = []
+    # Bucket completeness
     for t, b in bucket_by_t.items():
         if b is None:
-            reasons.append(f"Missing bucket for: {_fmt(t)}")
-
+            reasons.append(f"Missing bucket for {t}.")
+    # DA presence + range
     for t, d in da_by_t.items():
         if d is None:
-            reasons.append(f"Missing DA for: {_fmt(t)}")
+            reasons.append(f"Missing DA for {t}.")
             continue
         if int(d) < cfg.da_min or int(d) > cfg.da_max:
-            reasons.append(f"DA out of range [{cfg.da_min}, {cfg.da_max}] for: {_fmt(t)}")
-
+            reasons.append(f"DA for {t} out of range [{cfg.da_min}, {cfg.da_max}].")
     return (len(reasons) == 0), reasons
-
-
-def _humanize_reasons(reasons: List[str], t_meta: Optional[Dict[str, Tuple[int, str]]] = None) -> List[str]:
-    """Replace internal t# tokens (e.g., 't10') in validator messages with user-facing labels."""
-    if not t_meta:
-        return list(reasons)
-
-    def repl(match: re.Match) -> str:
-        t = match.group(0)
-        if t in t_meta:
-            pos, text = t_meta[t]
-            return f"{pos}) {text}"
-        return t
-
-    return [re.sub(r"\bt\d+\b", repl, str(r)) for r in reasons]
 
 
 def _get_row_index(item_idx: int) -> int:
@@ -211,16 +189,12 @@ def _sync_current_row_draft_to_workbook() -> None:
             b_key = label_to_key.get(str(b_label), "") or ""
         eval_ws.cell(row=rr, column=ec[f"bucket_t{t_idx}"]).value = str(b_key)
 
-        # DA (only if explicitly set)
-        da_is_set = bool(st.session_state.get(f"da_is_set_{cur_item_id}_{pos}", False))
-        if not da_is_set:
+        # DA
+        d_val = st.session_state.get(f"da_val_{cur_item_id}_{pos}")
+        try:
+            d_int = int(d_val) if d_val is not None else None
+        except Exception:
             d_int = None
-        else:
-            d_val = st.session_state.get(f"da_val_{cur_item_id}_{pos}")
-            try:
-                d_int = int(d_val) if d_val is not None else None
-            except Exception:
-                d_int = None
         eval_ws.cell(row=rr, column=ec[f"da_t{t_idx}"]).value = d_int
 
     # Comment
@@ -240,8 +214,9 @@ def _recompute_global_status():
     state = st.session_state.wb_state
     cfg: RunConfig = st.session_state.cfg
     wb = state.wb
+    inputs_ws = wb["inputs"]
     eval_ws = wb["eval"]
-    #ic = state.inputs_col
+    ic = state.inputs_col
     ec = state.eval_col
 
     invalid: List[int] = []
@@ -358,6 +333,8 @@ def _download_button(label: str):
     )
 
 
+
+
 def _sync_row_draft_to_workbook(
     *,
     item_idx: int,
@@ -410,50 +387,37 @@ def _sync_row_draft_to_workbook(
 
     changed = False
 
-
     for pos in range(1, cfg.num_translations + 1):
         tcol = dm[pos]          # e.g. "t7"
         t_idx = int(tcol[1:])   # 7
 
-        bucket_ss_key = f"bucket_pos_{item_id}_{pos}"
-        da_val_ss_key = f"da_val_{item_id}_{pos}"
-        da_set_ss_key = f"da_is_set_{item_id}_{pos}"
+        # Bucket (UI stores label; XLSX stores key)
+        b_label = st.session_state.get(f"bucket_pos_{item_id}_{pos}", placeholder)
+        b_key = ""
+        if b_label and str(b_label) != placeholder:
+            b_key = _label_to_key.get(str(b_label), "") or ""
 
-        # Bucket (UI stores label; XLSX stores key) — only sync if the key exists in session_state.
-        # This prevents overwriting previously-saved workbook values with placeholders during reruns.
-        if bucket_ss_key in st.session_state:
-            b_label = st.session_state.get(bucket_ss_key, placeholder)
-            b_key = ""
-            if b_label and str(b_label) != placeholder:
-                b_key = _label_to_key.get(str(b_label), "") or ""
+        cell_bucket = str(_eval_ws.cell(row=rr, column=_ec[f"bucket_t{t_idx}"]).value or "")
+        if cell_bucket != str(b_key):
+            changed = True
+            _eval_ws.cell(row=rr, column=_ec[f"bucket_t{t_idx}"]).value = str(b_key)
 
-            cell_bucket = str(_eval_ws.cell(row=rr, column=_ec[f"bucket_t{t_idx}"]).value or "")
-            if cell_bucket != str(b_key):
-                changed = True
-                _eval_ws.cell(row=rr, column=_ec[f"bucket_t{t_idx}"]).value = str(b_key)
+        # DA
+        d_val = st.session_state.get(f"da_val_{item_id}_{pos}")
+        try:
+            d_int = int(d_val) if d_val is not None else None
+        except Exception:
+            d_int = None
 
-        # DA — only sync if the "is_set" key exists in session_state (i.e., the user has interacted with it).
-        if da_set_ss_key in st.session_state:
-            da_is_set = bool(st.session_state.get(da_set_ss_key, False))
-            if not da_is_set:
-                d_int = None
-            else:
-                d_val = st.session_state.get(da_val_ss_key)
-                try:
-                    d_int = int(d_val) if d_val is not None else None
-                except Exception:
-                    d_int = None
+        cell_da = _eval_ws.cell(row=rr, column=_ec[f"da_t{t_idx}"]).value
+        try:
+            cell_da_int = int(cell_da) if cell_da is not None and str(cell_da).strip() != "" else None
+        except Exception:
+            cell_da_int = None
 
-            cell_da = _eval_ws.cell(row=rr, column=_ec[f"da_t{t_idx}"]).value
-            try:
-                cell_da_int = int(cell_da) if cell_da is not None and str(cell_da).strip() != "" else None
-            except Exception:
-                cell_da_int = None
-
-            if cell_da_int != d_int:
-                changed = True
-                _eval_ws.cell(row=rr, column=_ec[f"da_t{t_idx}"]).value = d_int
-
+        if cell_da_int != d_int:
+            changed = True
+            _eval_ws.cell(row=rr, column=_ec[f"da_t{t_idx}"]).value = d_int
 
     # Comment (draft)
     c = st.session_state.get(f"comment_{item_id}", None)
@@ -490,6 +454,20 @@ def _sync_all_rows_draft_to_workbook(*, clear_commit_if_changed: bool = True) ->
         )
 
 
+def _sync_all_rows_draft_to_workbook(clear_commit_if_changed=True) -> None:
+    """Backward-compatible wrapper: sync current row only."""
+    try:
+        if 'cur_idx' not in globals() or 'cur_item_id' not in globals():
+            return
+        _sync_row_draft_to_workbook(
+            item_idx=int(cur_idx),
+            item_id=int(cur_item_id),
+            clear_commit_if_changed=True,
+        )
+    except Exception:
+        return
+
+
 def _hydrate_row_state_from_workbook(item_id: int, *, overwrite: bool = False) -> None:
     """Load bucket/DA/comment values from the workbook into st.session_state for a given item.
 
@@ -513,35 +491,21 @@ def _hydrate_row_state_from_workbook(item_id: int, *, overwrite: bool = False) -
         key_to_label = cfg.bucket_labels_by_key  # bucket_key -> label
         placeholder = BUCKET_PLACEHOLDER
 
-        # Need display_map to map display pos -> canonical t#
-        dm_json = str(eval_ws.cell(row=rr, column=ec["display_map_json"]).value or "")
-        dm = parse_display_map(dm_json, cfg.num_translations) if dm_json else {p: f"t{p}" for p in range(1, cfg.num_translations + 1)}
-
         for pos in range(1, cfg.num_translations + 1):
-            tcol = dm[pos]          # e.g. "t7"
-            t_idx = int(tcol[1:])   # 7
-
             bucket_key = f"bucket_pos_{item_id}_{pos}"
             da_key = f"da_val_{item_id}_{pos}"
 
-            b_key = eval_ws.cell(row=rr, column=ec[f"bucket_t{t_idx}"]).value
+            b_key = eval_ws.cell(row=rr, column=ec[f"bucket_t{pos}"]).value
             b_label = key_to_label.get(str(b_key)) if b_key else None
             if overwrite or bucket_key not in st.session_state:
                 st.session_state[bucket_key] = b_label if b_label else placeholder
 
-            d_val = eval_ws.cell(row=rr, column=ec[f"da_t{t_idx}"]).value
-            da_set_key = f"da_is_set_{item_id}_{pos}"
-            if overwrite or da_key not in st.session_state or da_set_key not in st.session_state:
+            d_val = eval_ws.cell(row=rr, column=ec[f"da_t{pos}"]).value
+            if overwrite or da_key not in st.session_state:
                 try:
-                    if d_val is None or str(d_val).strip() == "":
-                        st.session_state[da_key] = None
-                        st.session_state[da_set_key] = False
-                    else:
-                        st.session_state[da_key] = int(d_val)
-                        st.session_state[da_set_key] = True
+                    st.session_state[da_key] = int(d_val) if d_val is not None else int(cfg.da_min)
                 except Exception:
-                    st.session_state[da_key] = None
-                    st.session_state[da_set_key] = False
+                    st.session_state[da_key] = int(cfg.da_min)
 
         c_key = f"comment_{item_id}"
         c_val = eval_ws.cell(row=rr, column=ec["comment"]).value
@@ -552,96 +516,69 @@ def _hydrate_row_state_from_workbook(item_id: int, *, overwrite: bool = False) -
         return
 
 
-def _collect_current_inputs(item_id: int) -> Tuple[Dict[str, Optional[str]], Dict[str, Optional[int]]]:
-    """
-    Collect current UI values for a specific item_id and return them keyed by canonical t#.
-    Uses the *current* display_map global (which is for the currently displayed row).
-    """
+# ---------------- Validate & Commit ----------------
+def _collect_current_inputs() -> Tuple[Dict[str, Optional[str]], Dict[str, Optional[int]]]:
     bucket_by_t: Dict[str, Optional[str]] = {}
     da_by_t: Dict[str, Optional[int]] = {}
 
-    bucket_placeholder = BUCKET_PLACEHOLDER
+    bucket_placeholder = "Select…"
 
     for pos in range(1, cfg.num_translations + 1):
         tcol = display_map[pos]  # e.g., "t7"
 
         # bucket radio value is a LABEL (or placeholder)
-        bucket_label = st.session_state.get(f"bucket_pos_{item_id}_{pos}", bucket_placeholder)
+        bucket_label = st.session_state.get(f"bucket_pos_{cur_item_id}_{pos}", bucket_placeholder)
         if bucket_label == bucket_placeholder:
             bucket_by_t[tcol] = None
         else:
             bucket_by_t[tcol] = label_to_key[str(bucket_label)]
 
-        # DA only counts if explicitly set
-        da_is_set = bool(st.session_state.get(f"da_is_set_{item_id}_{pos}", False))
-        if not da_is_set:
-            da_by_t[tcol] = None
-        else:
-            da_val = st.session_state.get(f"da_val_{item_id}_{pos}")
-            da_by_t[tcol] = int(da_val) if da_val is not None else None
+        # DA comes from model key
+        da_val = st.session_state.get(f"da_val_{cur_item_id}_{pos}")
+        da_by_t[tcol] = int(da_val) if da_val is not None else None
 
     return bucket_by_t, da_by_t
 
 
-def _write_eval_row(
-    *,
-    item_idx: int,
-    item_id: int,
-    bucket_by_t: Dict[str, str],
-    da_by_t: Dict[str, int],
-) -> None:
-    """
-    Write bucket_t# / da_t# + comment + committed_at + row_eval_hash
-    for the *specific* row identified by item_idx/item_id.
-    """
-    state = st.session_state.wb_state
-    cfg: RunConfig = st.session_state.cfg
-    if state is None or cfg is None:
-        return
-
-    rr = _get_row_index(int(item_idx))
-    _eval_ws = state.wb[state.eval_ws_name]
-    _ec = state.eval_col
-
-    # Pull row-specific display_map_json from the workbook (NOT a global)
-    display_map_json = str(_eval_ws.cell(row=rr, column=_ec["display_map_json"]).value or "")
-
-    # Pull comment from session state for THIS item_id
-    comment = str(st.session_state.get(f"comment_{item_id}", "") or "")
-
-    # Write in canonical t order
+def _write_eval_row(bucket_by_t: Dict[str, str], da_by_t: Dict[str, int]) -> None:
+    # Write bucket_t# / da_t# in canonical t order
     for i in range(1, cfg.num_translations + 1):
         tcol = f"t{i}"
-        _eval_ws.cell(row=rr, column=_ec[f"bucket_t{i}"]).value = bucket_by_t[tcol]
-        _eval_ws.cell(row=rr, column=_ec[f"da_t{i}"]).value = int(da_by_t[tcol])
+        eval_ws.cell(row=r, column=ec[f"bucket_t{i}"]).value = bucket_by_t[tcol]
+        eval_ws.cell(row=r, column=ec[f"da_t{i}"]).value = int(da_by_t[tcol])
 
-    _eval_ws.cell(row=rr, column=_ec["comment"]).value = comment
+    eval_ws.cell(row=r, column=ec["comment"]).value = comment or ""
 
     # Commit semantics
-    prev_committed = _eval_ws.cell(row=rr, column=_ec["committed_at"]).value
+    prev_committed = eval_ws.cell(row=r, column=ec["committed_at"]).value
     if prev_committed:
-        prev = _eval_ws.cell(row=rr, column=_ec["edit_count"]).value
+        # increment edit_count
+        prev = eval_ws.cell(row=r, column=ec["edit_count"]).value
         try:
             prev_i = int(prev) if prev is not None else 0
         except Exception:
             prev_i = 0
-        _eval_ws.cell(row=rr, column=_ec["edit_count"]).value = prev_i + 1
+        eval_ws.cell(row=r, column=ec["edit_count"]).value = prev_i + 1
     else:
-        _eval_ws.cell(row=rr, column=_ec["edit_count"]).value = 0
+        eval_ws.cell(row=r, column=ec["edit_count"]).value = 0
 
-    _eval_ws.cell(row=rr, column=_ec["committed_at"]).value = now_iso_utc()
+    eval_ws.cell(row=r, column=ec["committed_at"]).value = now_iso_utc()
 
     # Compute row_eval_hash
-    row_input_hash = str(_eval_ws.cell(row=rr, column=_ec["row_input_hash"]).value or "")
+    row_input_hash = str(eval_ws.cell(row=r, column=ec["row_input_hash"]).value or "")
     row_eval_hash = compute_row_eval_hash(
         bucket_by_t=bucket_by_t,
         da_by_t=da_by_t,
-        comment=comment,
+        comment=comment or "",
         display_map_json=display_map_json,
         row_input_hash=row_input_hash,
         run_id=state.run_id,
     )
-    _eval_ws.cell(row=rr, column=_ec["row_eval_hash"]).value = row_eval_hash
+    eval_ws.cell(row=r, column=ec["row_eval_hash"]).value = row_eval_hash
+
+
+def _current_committed_at() -> Optional[str]:
+    return eval_ws.cell(row=r, column=ec["committed_at"]).value
 
 
 def get_cur_idx():
@@ -673,12 +610,7 @@ def _rank_for_pos(pos: int) -> Tuple[int, int, int]:
             b_key = _label_to_key.get(str(bucket_label))
             bucket_rank = _bucket_key_to_rank.get(b_key, 999)
 
-    da_set = bool(st.session_state.get(f"da_is_set_{cur_item_id}_{pos}", False))
-
-    if da_set:
-        da_val = st.session_state.get(f"da_val_{cur_item_id}_{pos}", getattr(_cfg, "da_min", 1) if _cfg else 1)
-    else:
-        da_val = st.session_state.get(f"da_default_{cur_item_id}_{pos}", getattr(_cfg, "da_min", 1) if _cfg else 1)
+    da_val = st.session_state.get(f"da_val_{cur_item_id}_{pos}", getattr(_cfg, "da_min", 1) if _cfg else 1)
     try:
         da_i = int(da_val)
     except Exception:
@@ -970,9 +902,6 @@ if uploaded is not None:
         )
 
         if is_new_upload:
-            # Reset completion/finish state for a new workbook
-            st.session_state["show_summary"] = False
-            st.session_state["final_notice"] = False
             st.session_state.upload_name = uploaded.name
             st.session_state.upload_digest = digest
             st.session_state.wb_state = load_workbook_from_upload(file_bytes, cfg)
@@ -1147,13 +1076,8 @@ for pos, tcol, t_idx, text, existing_bucket_key, existing_da in pos_to_current:
         else:
             st.session_state[bucket_key] = BUCKET_PLACEHOLDER
 
-    da_set_key = f"da_is_set_{cur_item_id}_{pos}"
-
-    if da_set_key not in st.session_state:
-        st.session_state[da_set_key] = bool(existing_da is not None)
-
     if da_model_key not in st.session_state:
-        st.session_state[da_model_key] = int(existing_da) if existing_da is not None else None
+        st.session_state[da_model_key] = int(existing_da) if existing_da is not None else int(cfg.da_min)
 
 # Determine display order (stable unless auto/manual re-ordered)
 positions = [pos for (pos, *_rest) in pos_to_current]
@@ -1176,14 +1100,12 @@ else:
 positions = list(st.session_state[order_key])
 
 # Render per translation (in sorted order)
-pos_to_tuple = {t[0]: t for t in pos_to_current} # make a dict for easy lookup
 for pos in positions:
     # Look up original tuple by pos
-    # for tup in pos_to_current:
-    #     if tup[0] == pos:
-    #         _, tcol, t_idx, text, existing_bucket_key, existing_da = tup
-    #         break
-    _, tcol, t_idx, text, existing_bucket_key, existing_da = pos_to_tuple[pos]
+    for tup in pos_to_current:
+        if tup[0] == pos:
+            _, tcol, t_idx, text, existing_bucket_key, existing_da = tup
+            break
 
     # Determine current bucket key (for styling + slider range)
     bucket_label_current = st.session_state.get(f"bucket_pos_{cur_item_id}_{pos}", BUCKET_PLACEHOLDER)
@@ -1228,8 +1150,6 @@ for pos in positions:
             def _on_bucket_change(_pos=pos):
                 bkey = f"bucket_pos_{cur_item_id}_{_pos}"
                 dkey = f"da_val_{cur_item_id}_{_pos}"
-                da_set_key = f"da_is_set_{cur_item_id}_{_pos}"
-                da_default_key = f"da_default_{cur_item_id}_{_pos}"
                 prev_key_state = f"prev_bucket_key_{cur_item_id}_{_pos}"
 
                 new_label = st.session_state.get(bkey, BUCKET_PLACEHOLDER)
@@ -1261,12 +1181,7 @@ for pos in positions:
                         offset = (max(1, old_da) - 1) % int(da_intra)
                         new_da = int(new_rng[0]) + int(offset)
 
-                    if bool(st.session_state.get(da_set_key, False)):
-                        st.session_state[dkey] = int(new_da)
-                    else:
-                        # DA was never explicitly set; keep it unset and update the display default.
-                        st.session_state[dkey] = None
-                        st.session_state[da_default_key] = int((int(new_rng[0]) + int(new_rng[1])) // 2)
+                    st.session_state[dkey] = int(new_da)
 
                 # Update prev bucket + bump epoch so the slider can re-instantiate with new min/max
                 st.session_state[prev_key_state] = new_bucket_key
@@ -1286,13 +1201,9 @@ for pos in positions:
             )
 
         with col2:
-            # Slider (DA): show "unset until touched" state + icon
+            # Slider = SOURCE OF TRUTH (range is restricted by the chosen bucket)
             bucket_label_for_slider = st.session_state.get(bucket_key, BUCKET_PLACEHOLDER)
             bucket_key_for_slider = label_to_key.get(str(bucket_label_for_slider)) if bucket_label_for_slider != BUCKET_PLACEHOLDER else None
-
-            da_set_key = f"da_is_set_{cur_item_id}_{pos}"
-            da_default_key = f"da_default_{cur_item_id}_{pos}"
-            da_is_set = bool(st.session_state.get(da_set_key, False))
 
             if bucket_key_for_slider in bucket_order_best_first:
                 s_min, s_max = _bucket_range_for_key(
@@ -1308,51 +1219,32 @@ for pos in positions:
                 slider_disabled = True
                 slider_help = "Choose a quartile bucket to enable the slider"
 
-            s_min = int(s_min)
-            s_max = int(s_max)
+            # Clamp current model value into the slider range before rendering
+            try:
+                cur_da_model = int(st.session_state.get(da_model_key, int(cfg.da_min)))
+            except Exception:
+                cur_da_model = int(cfg.da_min)
+            cur_da_model = max(int(s_min), min(int(s_max), int(cur_da_model)))
+            st.session_state[da_model_key] = int(cur_da_model)
 
-            # Establish a stable display default for the "unset" case.
-            # We prefer midpoint so that "min" is not silently treated as a real choice.
-            if (not da_is_set) and (da_default_key not in st.session_state or slider_disabled):
-                st.session_state[da_default_key] = int((s_min + s_max) // 2)
-
-            # Determine what value to display on the slider.
-            if da_is_set:
-                try:
-                    cur_da_model = int(st.session_state.get(da_model_key))
-                except Exception:
-                    cur_da_model = int((s_min + s_max) // 2)
-                cur_da_model = max(s_min, min(s_max, cur_da_model))
-                st.session_state[da_model_key] = int(cur_da_model)
-                display_val = int(cur_da_model)
-            else:
-                display_val = int(st.session_state.get(da_default_key, int((s_min + s_max) // 2)))
-
-            def _on_da_slider_change(_skey: str, _mkey: str, _setkey: str):
+            def _on_da_slider_change(_skey: str, _mkey: str):
                 try:
                     st.session_state[_mkey] = int(st.session_state[_skey])
-                    st.session_state[_setkey] = True
                 except Exception:
-                    return
+                    pass
 
                 # Optional auto-reorder (configurable)
                 _maybe_auto_reorder_on_da_change(cfg=cfg, cur_item_id=cur_item_id)
-
-            # Icons: warn if DA not explicitly set; check if set.
-            icon = "✅" if (da_is_set and not slider_disabled) else ("⚠️" if not slider_disabled else "⏸️")
-            icon_help = "DA set" if icon == "✅" else ("DA not set yet" if icon == "⚠️" else "Select a bucket to enable DA")
-
-            st.markdown(f"**{icon} Direct Assessment** — {icon_help}")
-            st.markdown(f"<div class='mt-translation'>{text}</div>", unsafe_allow_html=True)
-
+            
+            st.write("Enter the direct assessment score for this translation (Note: Range changes based on quartile):")
             st.slider(
                 f"DA {pos}",
                 min_value=int(s_min),
                 max_value=int(s_max),
                 step=1,
-                value=int(display_val),
+                value=int(cur_da_model),
                 key=da_slider_wkey,
-                on_change=lambda sk=da_slider_wkey, mk=da_model_key, setk=da_set_key: _on_da_slider_change(sk, mk, setk),
+                on_change=lambda sk=da_slider_wkey, mk=da_model_key: _on_da_slider_change(sk, mk),
                 disabled=slider_disabled,
                 help=slider_help,
                 label_visibility="collapsed",
@@ -1365,11 +1257,8 @@ st.markdown("### Comment (optional)")
 comment = st.text_area("Comment", value=str(comment_val), key=f"comment_{cur_item_id}", label_visibility="collapsed")
 
 # Show current-row validation state (live)
-# Build a non-leaky mapping for messages: canonical t# -> (display_pos, translation_text)
-t_meta: Dict[str, Tuple[int, str]] = {tcol: (int(pos), str(text)) for (pos, tcol, _t_idx, text, _b, _d) in pos_to_current}
-
-bucket_by_t_live, da_by_t_live = _collect_current_inputs(int(cur_item_id))
-live_ok, live_reasons = _soft_validate_live(cfg, bucket_by_t_live, da_by_t_live, t_meta)
+bucket_by_t_live, da_by_t_live = _collect_current_inputs()
+live_ok, live_reasons = _soft_validate_live(cfg, bucket_by_t_live, da_by_t_live)
 
 if live_reasons:
     st.warning("Current sentence issues:\n- " + "\n- ".join(live_reasons))
@@ -1392,8 +1281,8 @@ with ctrl[1]:
         _recompute_global_status()
 
 with ctrl[2]:
-    if st.button("Commit & Next", key="next_btn", use_container_width=True, type="primary"):
-        bucket_by_t, da_by_t = _collect_current_inputs(int(cur_item_id))
+    if st.button("Next", key="next_btn", use_container_width=True, type="primary"):
+        bucket_by_t, da_by_t = _collect_current_inputs()
         ok, commit_reasons = validate_row(
             cfg=cfg,
             bucket_by_t=bucket_by_t,
@@ -1402,22 +1291,11 @@ with ctrl[2]:
             require_complete_for_next=True,
         )
         if not ok:
-            st.error("Cannot proceed. Fix:\n- " + "\n- ".join(_humanize_reasons(commit_reasons, t_meta)))
+            st.error("Cannot proceed. Fix:\n- " + "\n- ".join(commit_reasons))
         else:
-            _write_eval_row(
-                item_idx=int(cur_idx),
-                item_id=int(cur_item_id),
-                bucket_by_t=bucket_by_t,   # (validated -> all str)
-                da_by_t=da_by_t,           # (validated -> all int)
-            )
+            _write_eval_row(bucket_by_t, da_by_t)
             _recompute_global_status()
-            # If this was the last sentence, keep a persistent "download now" notice visible.
-            if int(cur_idx) >= int(N_items - 1):
-                st.session_state["final_notice"] = True
-                #st.session_state["show_summary"] = True
-                st.session_state.current_item_idx = int(N_items - 1)
-            else:
-                st.session_state.current_item_idx = min(cur_idx + 1, N_items - 1)
+            st.session_state.current_item_idx = min(cur_idx + 1, N_items - 1)
         st.session_state["pending_hydrate_item_id"] = int(state.item_ids[st.session_state.current_item_idx])
         _set_jump_to_sentence(int(st.session_state.current_item_idx) + 1)
         st.rerun()
@@ -1428,16 +1306,6 @@ no_invalid = (len(st.session_state.invalid_item_ids) == 0)
 
 st.divider()
 
-# Persistent completion notice: once all work is committed, keep this visible until page reload.
-if st.session_state.get("final_notice") and all_complete and no_invalid:
-    st.info(
-        "Thank you for completing the evaluation.  \n"
-        "PLEASE DOWNLOAD THE CHECKPOINT NOW. This is the only way to save your work!  \n\n"
-        "Download the final XLSX and send it to the research team.  \n"
-        "**Your evaluation is not complete until you download the checkpoint .xlsx file and send it to the research team.**  \n\n"
-        "This message will remain visible until you reload the page."
-    )
-
 finish_cols = st.columns([2, 2, 8])
 with finish_cols[0]:
     _download_button("Download checkpoint (xlsx)")
@@ -1445,9 +1313,15 @@ with finish_cols[0]:
 with finish_cols[1]:
     if st.button("Finish", disabled=not (all_complete and no_invalid), use_container_width=True, type="primary"):
         st.session_state["show_summary"] = True
-        st.session_state["final_notice"] = True
 
 if cfg.ui_show_completion_summary and st.session_state.get("show_summary") and all_complete and no_invalid:
+    st.info(
+            "PLEASE DOWNLOAD THE CHECKPOINT NOW. This is the only way to save your work!  \n\n"
+            "Download the final XLSX and send it to the research team.  \n"
+            "Reminder: The analysis is not complete until all you download the checkpoint .xslx file and send it to the research team.  \n"
+            "**The final .xlsx WILL NOT be available after you leave this screen, and all evaluations will be lost.**  \n\n"
+            "See the total information below. No per-system statistics are shown."
+            )
     st.markdown("## Completion summary (blind, aggregate only)")
 
     # Aggregate DA stats across all translations / all rows
@@ -1488,3 +1362,7 @@ if cfg.ui_show_completion_summary and st.session_state.get("show_summary") and a
 
     st.markdown("### Time per sentence (seconds)")
     st.json(time_stats)
+
+
+
+
