@@ -68,11 +68,23 @@ Enter the DA score using the slider.
 
 **Important behavior:**
 - The DA slider is **disabled until you choose a bucket**.
+- The DA slider initially rests at the **midpoint value** (e.g., 4 for 'Poor', 25 for 'Best'). You must **move** the slider to select a valid DA score.
 - The **slider range depends on the chosen bucket** (a restricted “quartile” range).
   Example: The acceptable DA range for 'Poor' is 1 - 7, while the range for 'Best' is 21 - 28.
 - DA must be an **integer** within the allowed range shown on the slider.
 
 If you change the bucket after setting DA, the app will **remap** your DA into the new bucket's allowed range to keep the relative value of your choice.
+
+**NOTE:** 
+-- Please note that in order for the DA score to be validated you need to **move** the slider.
+- If your selected DA point is distinct from the default midpoint, you should first click the mouse button, then move the marker to your selected location, then release the mouse button
+- If your selected DA point **IS** the default midpoint, you should first click the slider to move the marker away from the default midpoint, then release, and then click to move the mouse back to the midpoint.
+
+**Direct Assessment Statuses:**  
+&nbsp;&nbsp;&nbsp;&nbsp;⏸️ Direct Assessment — Select a bucket to enable DA  
+&nbsp;&nbsp;&nbsp;&nbsp;⚠️ Direct Assessment — DA not yet set  
+&nbsp;&nbsp;&nbsp;&nbsp;✅ Direct Assessment — DA set  
+
 
 ### C) Optional comment
 You may add a sentence-level comment in the **Comment (optional)** box.
